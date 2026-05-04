@@ -786,23 +786,38 @@ Surfaces the values that load-bear in TRAMP `make-process' paths:
 the connection-shell TERM (`tramp-terminal-type'), whether the
 direct-async path applies, multi-hop status, and the local-vs-
 toplevel TERM mismatch that drives `tramp-local-environment-
-variable-p' to silently strip ghostel's pushed TERM."
+variable-p' to silently strip ghostel's pushed TERM.
+
+Each value is read with a `boundp'/`fboundp' guard — older TRAMP
+versions (notably the one bundled with Emacs 28) lack
+`tramp-direct-async-process' / `tramp-direct-async-process-p',
+and the report should still render usefully on those Emacsen."
   (require 'tramp)
   (insert (format "tramp-version:       %s\n"
                   (condition-case _ (tramp-version nil)
                     (error "(unavailable)"))))
-  (insert (format "tramp-terminal-type: %s\n" tramp-terminal-type))
+  (insert (format "tramp-terminal-type: %s\n"
+                  (if (boundp 'tramp-terminal-type)
+                      tramp-terminal-type
+                    "(unavailable)")))
   ;; tramp-direct-async-process is a defvar; report both the global
   ;; and the connection-local-resolved value (they often differ).
-  (let ((global (default-value 'tramp-direct-async-process))
-        (effective
-         (condition-case _
-             (with-parsed-tramp-file-name dir nil
-               (with-connection-local-variables
-                tramp-direct-async-process))
-           (error :unknown))))
-    (insert (format "direct-async (global):    %S\n" global))
-    (insert (format "direct-async (effective): %S\n" effective)))
+  ;; Added in TRAMP 2.5 — Emacs 28 ships an older bundled TRAMP that
+  ;; doesn't have it, so guard with `boundp'.
+  (cond
+   ((not (boundp 'tramp-direct-async-process))
+    (insert "direct-async (global):    (unavailable on this TRAMP version)\n")
+    (insert "direct-async (effective): (unavailable on this TRAMP version)\n"))
+   (t
+    (let ((global (default-value 'tramp-direct-async-process))
+          (effective
+           (condition-case _
+               (with-parsed-tramp-file-name dir nil
+                 (with-connection-local-variables
+                  tramp-direct-async-process))
+             (error :unknown))))
+      (insert (format "direct-async (global):    %S\n" global))
+      (insert (format "direct-async (effective): %S\n" effective)))))
   ;; Would TRAMP dispatch direct-async for a make-process call here?
   ;; Use a synthetic args plist that mimics ghostel's spawn shape.
   (let ((dispatched
@@ -814,15 +829,18 @@ variable-p' to silently strip ghostel's pushed TERM."
                      :buffer nil :stderr nil)))
            (error :unknown))))
     (insert (format "Would dispatch direct-async: %s\n"
-                    (cond ((eq dispatched :unknown) "(unknown)")
+                    (cond ((not (fboundp 'tramp-direct-async-process-p))
+                           "(unavailable on this TRAMP version)")
+                          ((eq dispatched :unknown) "(unknown)")
                           (dispatched "yes")
                           (t "no")))))
   ;; Multi-hop path matters because direct-async refuses multi-hop
   ;; and some env-stripping/connection-shell behaviors differ.
-  (let ((hops (condition-case _
-                  (with-parsed-tramp-file-name dir vec
-                    (length (tramp-compute-multi-hops vec)))
-                (error nil))))
+  (let ((hops (and (fboundp 'tramp-compute-multi-hops)
+                   (condition-case _
+                       (with-parsed-tramp-file-name dir vec
+                         (length (tramp-compute-multi-hops vec)))
+                     (error nil)))))
     (insert (format "Multi-hop length:    %s\n" (or hops "(unknown)"))))
   ;; The TERM-stripping diagnostic that drove the second #224 fix.
   ;; If `(getenv "TERM")' equals an entry in the default-toplevel
