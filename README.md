@@ -42,7 +42,7 @@ binaries are available for:
 - `x86_64-freebsd`
 
 If you prefer to build from source or need a different platform, you'll also need
-[Zig](https://ziglang.org/) 0.15.2+ (see [Building from source](#building-from-source)).
+[Zig](https://ziglang.org/) 0.15.2 (see [Building from source](#building-from-source)).
 
 ## Installation
 
