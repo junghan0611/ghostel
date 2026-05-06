@@ -36,6 +36,9 @@
 (declare-function ghostel--alt-screen-p "ghostel-module")
 (declare-function ghostel--mode-enabled "ghostel-module")
 (declare-function ghostel--module-version "ghostel-module")
+(declare-function ghostel--encode-key "ghostel-module")
+(declare-function ghostel--new "ghostel-module")
+(declare-function ghostel--raw-key-sequence "ghostel")
 
 ;; Forward declarations for TRAMP symbols read by `ghostel-debug-info'
 ;; that don't exist on every supported Emacs.  The actual reads are
@@ -778,6 +781,55 @@ omit it when the connection itself is the suspected fault."
                                   (if remap
                                       (format "%S" remap)
                                     "(none)"))))))))
+        ;; Key encoding probe — show the bytes Ghostel produces for chords
+        ;; that commonly drive `.inputrc' / readline issue reports (#239).
+        ;; Probes a fresh legacy-mode terminal so the bytes are what readline
+        ;; sees in its default state, regardless of whether the live terminal
+        ;; has kitty keyboard / modifyOtherKeys turned on by some app.
+        (insert "\n--- Key encoding (legacy mode) ---\n")
+        (cond
+         ((not (fboundp 'ghostel--encode-key))
+          (insert "(native module not loaded — cannot probe encoder)\n"))
+         (t
+          (let ((probe (ignore-errors (ghostel--new 25 80 100)))
+                (sent nil))
+            (cond
+             ((null probe)
+              (insert "(could not create probe terminal)\n"))
+             (t
+              (cl-letf (((symbol-function 'ghostel--flush-output)
+                         (lambda (s) (setq sent s))))
+                (dolist (chord '(("backspace" ""          "Backspace")
+                                 ("backspace" "ctrl"      "C-Backspace")
+                                 ("backspace" "meta"      "M-Backspace")
+                                 ("f"         "meta"      "M-f")
+                                 ("b"         "meta"      "M-b")
+                                 ("f"         "ctrl,meta" "C-M-f")
+                                 ("v"         "ctrl,meta" "C-M-v")
+                                 ("h"         "ctrl"      "C-h")))
+                  (setq sent nil)
+                  ;; Mirror `ghostel--send-encoded': try encoder, fall back
+                  ;; to the raw-key-sequence path on nil.  Encoder skips
+                  ;; plain Meta+letter when no utf8 is supplied (live
+                  ;; keystrokes don't supply it either) — the fallback
+                  ;; produces ESC + char.
+                  (unless (ghostel--encode-key probe (nth 0 chord)
+                                               (nth 1 chord) nil)
+                    (setq sent (ghostel--raw-key-sequence (nth 0 chord)
+                                                          (nth 1 chord))))
+                  (insert (format "  %-13s → %s\n"
+                                  (nth 2 chord)
+                                  (cond ((null sent) "(no output)")
+                                        ((string-empty-p sent) "(empty)")
+                                        (t (mapconcat
+                                            (lambda (b) (format "0x%02x" b))
+                                            (string-to-list sent) " ")))))))
+              (insert "\nReadline `.inputrc' rules expecting these byte streams:\n")
+              (insert "  \"\\C-?\"     → 0x7f          (Backspace)\n")
+              (insert "  \"\\C-\\b\"    → 0x08          (C-Backspace, also C-h in legacy)\n")
+              (insert "  \"\\eb\"      → 0x1b 0x62     (M-b)\n")
+              (insert "  \"\\e\\C-f\"   → 0x1b 0x06     (C-M-f)\n")
+              (insert "  \"\\e\\C-v\"   → 0x1b 0x16     (C-M-v)\n"))))))
         ;; Non-default ghostel settings
         (insert "\n--- Non-default ghostel settings ---\n")
         (let (changed)
@@ -1110,7 +1162,12 @@ Then runs ghostel's actual remote-term preamble inside the same
 probe shell and reports what TERM the spawned shell would inherit.
 This is the load-bearing piece: it answers `what does ghostel's
 shell actually see' rather than `what does TRAMP's connection
-shell export', which is `TERM=dumb' regardless of preamble."
+shell export', which is `TERM=dumb' regardless of preamble.
+
+Last, probes bash version and dumps `~/.inputrc' (or `$INPUTRC'
+when set) so issue reports about readline rules not firing — see
+issue #239 — carry the actual rule file alongside the byte stream
+ghostel produces (rendered locally in the `Key encoding' section)."
   (let* ((preamble (ghostel--remote-term-preamble))
          ;; Strip the trailing "; " so we can append more commands.
          (preamble-clean (replace-regexp-in-string "; *\\'" "" preamble))
@@ -1150,7 +1207,28 @@ shell export', which is `TERM=dumb' regardless of preamble."
            "  echo \"  TERM_PROGRAM=${TERM_PROGRAM:-unset}\"; "
            "  echo \"  TERM_PROGRAM_VERSION=${TERM_PROGRAM_VERSION:-unset}\"; "
            "  echo \"  COLORTERM=${COLORTERM:-unset}\"; "
-           ") 2>&1")))
+           ") 2>&1; "
+           ;; Bash + inputrc probe — answers `.inputrc' issue reports
+           ;; (e.g. #239).  Surfaces bash version, the resolved INPUTRC
+           ;; path, and the file's contents so we can spot $if-term
+           ;; gates, syntax errors, or rules referencing different byte
+           ;; streams than ghostel produces (cross-check against the
+           ;; local `Key encoding' section).  Bound to 80 lines so a
+           ;; large customized inputrc doesn't drown the report.
+           "echo; echo '== bash + inputrc =='; "
+           "if command -v bash >/dev/null 2>&1; then "
+           "  bash --version 2>/dev/null | head -1; "
+           "else echo 'bash: NOT ON PATH'; fi; "
+           "echo \"INPUTRC=${INPUTRC:-unset}\"; "
+           "echo \"HOME=$HOME\"; "
+           "inputrc_path=${INPUTRC:-$HOME/.inputrc}; "
+           "if [ -e \"$inputrc_path\" ]; then "
+           "  lines=$(wc -l < \"$inputrc_path\" 2>/dev/null); "
+           "  echo \"$inputrc_path: $lines lines\"; "
+           "  echo '----- contents (first 80 lines) -----'; "
+           "  head -80 \"$inputrc_path\"; "
+           "  echo '----- end inputrc -----'; "
+           "else echo \"$inputrc_path: missing\"; fi")))
     (with-temp-buffer
       (let* ((default-directory (with-current-buffer ghostel-buf
                                   default-directory))
