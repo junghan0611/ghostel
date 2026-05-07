@@ -1838,6 +1838,78 @@ Detect that case via `this-command-keys-vector' and re-inject meta."
     (when key-name
       (ghostel--send-encoded key-name mod-str))))
 
+
+;;; Input method integration
+;;
+;; Some Emacs input methods commit text by directly inserting into the
+;; buffer rather than returning events from `input-method-function'.
+;; The canonical example is `hangul-input-method' (lisp/leim/quail/hangul.el),
+;; whose `hangul-insert-character' calls `(self-insert-command 1)' as a
+;; function with `last-command-event' bound to the composed character.
+;; A function call bypasses `[remap self-insert-command]' in the keymap,
+;; so the character lands in the ghostel buffer but is never sent to
+;; the PTY; the next redraw then erases it.
+;;
+;; Wrap `input-method-function' locally in ghostel buffers.  Around the
+;; original IME call, observe whether point advanced — if so, the IME
+;; committed text by buffer insertion.  Capture that text, delete it
+;; from the buffer, and forward it to the PTY as UTF-8.  The shell
+;; echoes it back through the normal redraw path, so the buffer ends
+;; up consistent without us racing the redraw.
+;;
+;; IMEs that already return events (most quail packages, e.g. uni-input)
+;; pass straight through: the wrapper observes no point change and
+;; returns the events unchanged.
+
+(defvar-local ghostel--ime-original-input-method-function nil
+  "Original buffer-local `input-method-function' before ghostel wrapped it.
+Restored by `ghostel--ime-uninstall'.")
+
+(defun ghostel--ime-wrap-input-method (key)
+  "Translate KEY through the original input method, forwarding any
+buffer-inserted commit text to the PTY.
+
+See the section commentary above for the rationale."
+  (let ((orig ghostel--ime-original-input-method-function)
+        (before-point (point)))
+    (if (null orig)
+        (list key)
+      (let ((events (funcall orig key)))
+        (let ((after-point (point)))
+          (when (> after-point before-point)
+            (let ((inserted (buffer-substring-no-properties
+                             before-point after-point)))
+              (delete-region before-point after-point)
+              (ghostel--send-string
+               (encode-coding-string inserted 'utf-8)))))
+        events))))
+
+(defun ghostel--ime-install ()
+  "Wrap `input-method-function' in this ghostel buffer if an IME is active.
+Idempotent.  Intended for `input-method-activate-hook'."
+  (when (and (derived-mode-p 'ghostel-mode)
+             input-method-function
+             (not (eq input-method-function
+                      #'ghostel--ime-wrap-input-method)))
+    (setq-local ghostel--ime-original-input-method-function
+                input-method-function)
+    (setq-local input-method-function
+                #'ghostel--ime-wrap-input-method)))
+
+(defun ghostel--ime-uninstall ()
+  "Restore the original `input-method-function'.
+Intended for `input-method-deactivate-hook'."
+  (when (and (derived-mode-p 'ghostel-mode)
+             (eq input-method-function
+                 #'ghostel--ime-wrap-input-method))
+    (setq-local input-method-function
+                ghostel--ime-original-input-method-function)
+    (setq-local ghostel--ime-original-input-method-function nil)))
+
+(add-hook 'input-method-activate-hook #'ghostel--ime-install)
+(add-hook 'input-method-deactivate-hook #'ghostel--ime-uninstall)
+
+
 
 ;;; Public input API
 
