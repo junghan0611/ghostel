@@ -8369,6 +8369,61 @@ but `this-command-keys-vector' retains the ESC prefix."
       (should (equal pasted '("combo")))
       (should (equal (car kill-ring) "combo")))))
 
+(ert-deftest ghostel-test-xterm-paste-no-exit-when-fast-exit-disabled ()
+  "With `ghostel-readonly-fast-exit' nil, `ghostel-xterm-paste' stays in copy mode.
+The paste is still forwarded to the terminal (matching `ghostel-yank')."
+  (let ((pasted nil)
+        (exit-called nil)
+        (ghostel--input-mode 'copy)
+        (ghostel-readonly-fast-exit nil)
+        (xterm-store-paste-on-kill-ring nil))
+    (cl-letf (((symbol-function 'ghostel--paste-text)
+               (lambda (text) (push text pasted)))
+              ((symbol-function 'ghostel-readonly-exit)
+               (lambda () (setq exit-called t))))
+      (ghostel-xterm-paste '(xterm-paste "payload"))
+      (should-not exit-called)
+      (should (equal pasted '("payload"))))))
+
+;; -----------------------------------------------------------------------
+;; Test: ghostel-readonly-copy
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-readonly-copy-exits-when-fast-exit-enabled ()
+  "`ghostel-readonly-copy' kills the region and exits when fast exit is on."
+  (let ((exit-called nil)
+        (kill-ring nil)
+        (kill-ring-yank-pointer nil)
+        (ghostel-readonly-fast-exit t))
+    (with-temp-buffer
+      (transient-mark-mode 1)
+      (insert "hello world")
+      (push-mark (point-min) t t)
+      (goto-char (point-max))
+      (cl-letf (((symbol-function 'ghostel-readonly-exit)
+                 (lambda () (setq exit-called t))))
+        (ghostel-readonly-copy))
+      (should exit-called)
+      (should (equal (car kill-ring) "hello world")))))
+
+(ert-deftest ghostel-test-readonly-copy-no-exit-when-fast-exit-disabled ()
+  "With `ghostel-readonly-fast-exit' nil, `ghostel-readonly-copy' copies but stays.
+The selection still lands on the kill ring; only the auto-exit is suppressed."
+  (let ((exit-called nil)
+        (kill-ring nil)
+        (kill-ring-yank-pointer nil)
+        (ghostel-readonly-fast-exit nil))
+    (with-temp-buffer
+      (transient-mark-mode 1)
+      (insert "hello world")
+      (push-mark (point-min) t t)
+      (goto-char (point-max))
+      (cl-letf (((symbol-function 'ghostel-readonly-exit)
+                 (lambda () (setq exit-called t))))
+        (ghostel-readonly-copy))
+      (should-not exit-called)
+      (should (equal (car kill-ring) "hello world")))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: ghostel-readonly-recenter
 ;; -----------------------------------------------------------------------
@@ -12333,6 +12388,9 @@ slip past the unit tests."
     ghostel-test-xterm-paste-exits-copy-mode
     ghostel-test-xterm-paste-bound-in-keymaps
     ghostel-test-xterm-paste-copy-mode-and-kill-ring
+    ghostel-test-xterm-paste-no-exit-when-fast-exit-disabled
+    ghostel-test-readonly-copy-exits-when-fast-exit-enabled
+    ghostel-test-readonly-copy-no-exit-when-fast-exit-disabled
     ghostel-test-char-mode-key-bindings
     ghostel-test-copy-mode-recenter
     ghostel-test-input-mode-default-is-semi-char

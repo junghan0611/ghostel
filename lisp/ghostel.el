@@ -1920,7 +1920,8 @@ parity with `xterm-paste'."
   (interactive "e")
   (unless (eq (car-safe event) 'xterm-paste)
     (error "This command must be bound to an xterm-paste event"))
-  (when (eq ghostel--input-mode 'copy)
+  (when (and (eq ghostel--input-mode 'copy)
+             ghostel-readonly-fast-exit)
     (ghostel-readonly-exit))
   (when-let* ((text (nth 1 event)))
     (when (bound-and-true-p xterm-store-paste-on-kill-ring)
@@ -2379,16 +2380,18 @@ These are newlines with the `ghostel-wrap' text property."
     (mapconcat #'identity trimmed "\n")))
 
 (defun ghostel-readonly-copy ()
-  "Copy the selected region and exit read-only mode.
+  "Copy the selected region.
 Soft-wrapped newlines are removed and trailing whitespace is
-stripped so the copied text matches the original terminal content."
+stripped so the copied text matches the original terminal content.
+When `ghostel-readonly-fast-exit' is non-nil, also exits read-only mode."
   (interactive)
   (when (use-region-p)
     (let ((text (ghostel--clean-copy-text
                  (buffer-substring (region-beginning) (region-end)))))
       (kill-new text)
       (message "Copied to kill ring")))
-  (ghostel-readonly-exit))
+  (when ghostel-readonly-fast-exit
+    (ghostel-readonly-exit)))
 
 
 ;;; Line mode
