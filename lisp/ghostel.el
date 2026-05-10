@@ -1860,6 +1860,14 @@ Detect that case via `this-command-keys-vector' and re-inject meta."
 ;; IMEs that already return events (most quail packages, e.g. uni-input)
 ;; pass straight through: the wrapper observes no point change and
 ;; returns the events unchanged.
+;;
+;; Only active in modes where typed keys are forwarded to the PTY
+;; (semi-char, char) — gated on `ghostel--buffer-editable-p'.  In line
+;; mode the buffered input region is the source of truth and the local
+;; snapshot/restore path keeps it across redraws; deleting the IME
+;; commit and shipping it to the PTY would erase the user's in-progress
+;; line.  In emacs/copy modes the buffer is read-only so an IME insert
+;; would signal `text-read-only' before reaching here anyway.
 
 (defvar-local ghostel--ime-original-input-method-function nil
   "Original buffer-local `input-method-function' before ghostel wrapped it.
@@ -1876,7 +1884,8 @@ See the section commentary above for the rationale."
         (list key)
       (let ((events (funcall orig key)))
         (let ((after-point (point)))
-          (when (> after-point before-point)
+          (when (and (> after-point before-point)
+                     (ghostel--buffer-editable-p))
             (let ((inserted (buffer-substring-no-properties
                              before-point after-point)))
               (delete-region before-point after-point)
