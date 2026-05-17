@@ -36,6 +36,7 @@ pending_resize: ?ViewportSize = null,
 /// Reusable instance of RowContent to reduce allocations
 row: RowContent = .{},
 
+/// Cached information about font metrics, used for glyph scaling
 font_info: ?FontInfo = null,
 
 /// Bold text coloring configuration.
@@ -491,9 +492,9 @@ pub const RowContent = struct {
 
     const CellInfo = struct {
         byte_start: usize,
-        byte_len: usize,
+        byte_end: usize,
         char_start: usize,
-        char_len: usize,
+        char_end: usize,
         wide: bool,
     };
 
@@ -610,9 +611,9 @@ pub const RowContent = struct {
             if (self.graphemes.items.len > 1 or self.graphemes.items[0] >= adjustment_threshold) {
                 try self.adjust_cells.append(RowContent.allocator, .{
                     .byte_start = byte_start,
-                    .byte_len = self.text.items.len - byte_start,
+                    .byte_end = self.text.items.len,
                     .char_start = char_start,
-                    .char_len = self.char_len - char_start,
+                    .char_end = self.char_len,
                     .wide = wide == gt.c.GHOSTTY_CELL_WIDE_WIDE,
                 });
             }
@@ -690,52 +691,62 @@ fn readRowHints(row: gt.c.GhosttyRow) !RowHints {
 fn adjustGlyphs(self: *Self, env: emacs.Env, row_start: i64) void {
     if (self.row.adjust_cells.items.len == 0) return;
     if (self.font_info == null) return;
+    const window = env.f("selected-window", .{});
+    if (env.isNil(window)) return;
+
+    for (self.row.adjust_cells.items) |*cell| {
+        self.adjustGlyph(env, window, row_start, cell);
+    }
+}
+
+fn adjustGlyph(
+    self: *Self,
+    env: emacs.Env,
+    window: emacs.Value,
+    row_start: i64,
+    cell: *const RowContent.CellInfo,
+) void {
     const default_font_info = self.font_info.?;
 
     const s = emacs.sym;
 
-    const window = env.f("selected-window", .{});
-    if (env.isNil(window)) return;
+    const start_val = env.makeInteger(row_start + @as(i64, @intCast(cell.char_start)));
+    const end_val = env.makeInteger(row_start + @as(i64, @intCast(cell.char_end)));
+    const font = env.f("font-at", .{ start_val, window });
+    // TODO: Maybe we should replace the cell with something else if there
+    //       is no font. Today, it will just show the missing char glyph,
+    //       which will push the line size bigger. This is rare, though.
+    //       Most chars are covered by SOME font on the system.
+    if (env.isNil(font)) return;
 
-    for (self.row.adjust_cells.items) |cell| {
-        const start_val = env.makeInteger(row_start + @as(i64, @intCast(cell.char_start)));
-        const end_val = env.makeInteger(row_start + @as(i64, @intCast(cell.char_start + cell.char_len)));
-        const font = env.f("font-at", .{ start_val, window });
-        // TODO: Maybe we should replace the cell with something else if there
-        //       is no font. Today, it will just show the missing char glyph,
-        //       which will push the line size bigger. This is rare, though.
-        //       Most chars are covered by SOME font on the system.
-        if (env.isNil(font)) continue;
+    const font_info = env.f("query-font", .{font});
+    const ascent = env.extractInteger(env.vecGet(font_info, 4));
+    const descent = env.extractInteger(env.vecGet(font_info, 5));
+    const height = ascent + descent;
 
-        const font_info = env.f("query-font", .{font});
-        const ascent = env.extractInteger(env.vecGet(font_info, 4));
-        const descent = env.extractInteger(env.vecGet(font_info, 5));
-        const height = ascent + descent;
+    const glyphs = env.f("font-get-glyphs", .{ font, start_val, end_val });
+    if (env.vecSize(glyphs) == 0) return;
 
-        const glyphs = env.f("font-get-glyphs", .{ font, start_val, end_val });
-        if (env.vecSize(glyphs) == 0) continue;
+    // Each element is a vector containing information of a glyph in this format:
+    // [FROM-IDX TO-IDX C CODE WIDTH LBEARING RBEARING ASCENT DESCENT ADJUSTMENT]
+    const glyph = env.vecGet(glyphs, 0);
+    const width = env.extractInteger(env.vecGet(glyph, 4));
+    const num_cells: i64 = if (cell.wide) 2 else 1;
 
-        // Each element is a vector containing information of a glyph in this format:
-        // [FROM-IDX TO-IDX C CODE WIDTH LBEARING RBEARING ASCENT DESCENT ADJUSTMENT]
-        const glyph = env.vecGet(glyphs, 0);
-        const width = env.extractInteger(env.vecGet(glyph, 4));
-        const num_cells: i64 = if (cell.wide) 2 else 1;
+    const max_width = default_font_info.width * num_cells;
 
-        const max_width = default_font_info.width * num_cells;
+    // Skip adjustments if size already matches perfectly
+    if (max_width == width and default_font_info.height == height) return;
 
-        // Skip adjustments if size already matches perfectly
-        if (max_width == width and default_font_info.height == height) continue;
+    // We add a fudge factor of +1 to the denominator to ensure fit
+    const scale_width = @as(f64, @floatFromInt(max_width)) / @as(f64, @floatFromInt(width + 1));
+    const scale_height = @as(f64, @floatFromInt(default_font_info.height)) / @as(f64, @floatFromInt(height + 1));
+    const scale = @min(scale_width, scale_height);
 
-        // We add a fudge factor of +1 to the denominator to ensure fit
-        const scale_width = @as(f64, @floatFromInt(max_width)) / @as(f64, @floatFromInt(width + 1));
-        const scale_height = @as(f64, @floatFromInt(default_font_info.height)) / @as(f64, @floatFromInt(height + 1));
-        const scale = @min(scale_width, scale_height);
-
-        const min_width_spec = env.list(.{ s.@"min-width", env.list(.{num_cells}) });
-        const scale_spec = env.list(.{ s.height, scale });
-        const display_spec = env.list(.{ min_width_spec, scale_spec });
-        _ = env.f("put-text-property", .{ start_val, end_val, s.display, display_spec });
-    }
+    const min_width_spec = env.list(.{ s.@"min-width", env.list(.{num_cells}) });
+    const scale_spec = env.list(.{ s.height, scale });
+    const display_spec = env.list(.{ min_width_spec, scale_spec });
+    _ = env.f("put-text-property", .{ start_val, end_val, s.display, display_spec });
 }
 
 /// Insert row text and apply property runs.
