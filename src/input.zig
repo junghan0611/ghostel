@@ -44,8 +44,7 @@ pub fn encodeAndSend(env: emacs.Env, term: *Terminal, key: Key, mods: Mods, utf8
     if (written == 0) return false;
 
     // Send encoded bytes to the PTY via Elisp
-    const str = env.makeString(buf[0..written]);
-    _ = env.call1(env.intern("ghostel--flush-output"), str);
+    _ = env.f("ghostel--flush-output", .{buf[0..written]});
 
     return true;
 }
@@ -59,8 +58,8 @@ pub fn encodeAndSendMouse(env: emacs.Env, term: *Terminal, action: i64, button: 
     // Set size: 1 pixel = 1 cell so Emacs cell coords map directly
     var size: gt.c.GhosttyMouseEncoderSize = .{
         .size = @sizeOf(gt.c.GhosttyMouseEncoderSize),
-        .screen_width = term.size.cols,
-        .screen_height = term.size.rows,
+        .screen_width = term.renderer.size.cols,
+        .screen_height = term.renderer.size.rows,
         .cell_width = 1,
         .cell_height = 1,
         .padding_top = 0,
@@ -103,8 +102,7 @@ pub fn encodeAndSendMouse(env: emacs.Env, term: *Terminal, action: i64, button: 
     if (written == 0) return false;
 
     // Send to PTY
-    const str = env.makeString(buf[0..written]);
-    _ = env.call1(env.intern("ghostel--flush-output"), str);
+    _ = env.f("ghostel--flush-output", .{buf[0..written]});
     return true;
 }
 

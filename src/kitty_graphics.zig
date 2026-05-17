@@ -83,22 +83,21 @@ fn emitOnePlacement(
     // row is viewport_row + scrollback_in_buffer.  Compute it on this side
     // so the elisp callback can do a single forward-line from point-min.
     const abs_row: i64 = @as(i64, @intCast(info.viewport_row)) +
-        @as(i64, @intCast(term.rows_in_buffer - term.size.rows));
-    var args = [_]emacs.Value{
+        @as(i64, @intCast(term.renderer.rows_in_buffer - term.renderer.size.rows));
+    _ = env.f("ghostel--kitty-display-image", .{
         img_val,
         if (emacs_data.is_png) env.t() else env.nil(),
-        env.makeInteger(abs_row),
-        env.makeInteger(@intCast(info.viewport_col)),
-        env.makeInteger(@intCast(info.grid_cols)),
-        env.makeInteger(@intCast(info.grid_rows)),
-        env.makeInteger(@intCast(info.pixel_width)),
-        env.makeInteger(@intCast(info.pixel_height)),
-        env.makeInteger(@intCast(info.source_x)),
-        env.makeInteger(@intCast(info.source_y)),
-        env.makeInteger(@intCast(info.source_width)),
-        env.makeInteger(@intCast(info.source_height)),
-    };
-    _ = env.funcall(emacs.sym.@"ghostel--kitty-display-image", &args);
+        abs_row,
+        info.viewport_col,
+        info.grid_cols,
+        info.grid_rows,
+        info.pixel_width,
+        info.pixel_height,
+        info.source_x,
+        info.source_y,
+        info.source_width,
+        info.source_height,
+    });
 }
 
 /// Image bytes ready to hand to Emacs.

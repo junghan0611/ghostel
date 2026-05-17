@@ -157,60 +157,36 @@ succeeds."
 ;; -----------------------------------------------------------------------
 
 (ert-deftest ghostel-test-cursor-position ()
-  "Test `ghostel--cursor-position' returns correct (COL . ROW)."
+  "Test `ghostel--cursor-pos' set to correct (COL . ROW)."
   (let ((term (ghostel--new 25 80 1000)))
+    (ghostel--redraw term)
+
     ;; Origin
-    (should (equal '(0 . 0) (ghostel--cursor-position term)))
+    (should (equal '(0 . 0) ghostel--cursor-pos))
 
     ;; After writing text
     (ghostel--write-input term "hello")
-    (should (equal '(5 . 0) (ghostel--cursor-position term)))
+    (ghostel--redraw term)
+    (should (equal '(5 . 0) ghostel--cursor-pos))
 
     ;; After cursor movement
     (ghostel--write-input term "\e[3D")
-    (should (equal '(2 . 0) (ghostel--cursor-position term)))
+    (ghostel--redraw term)
+    (should (equal '(2 . 0) ghostel--cursor-pos))
 
     ;; After newline — cursor on row 1
     (ghostel--write-input term "\nworld")
-    (should (equal '(5 . 1) (ghostel--cursor-position term)))
+    (ghostel--redraw term)
+    (should (equal '(5 . 1) ghostel--cursor-pos))
 
     ;; Absolute positioning
     (ghostel--write-input term "\e[4;6H")
-    (should (equal '(5 . 3) (ghostel--cursor-position term)))))
+    (ghostel--redraw term)
+    (should (equal '(5 . 3) ghostel--cursor-pos))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: erase sequences
 ;; -----------------------------------------------------------------------
-
-(ert-deftest ghostel-test-cursor-position-preserves-viewport ()
-  "`ghostel--cursor-position' must not move the viewport.
-The function temporarily scrolls to the bottom to query the cursor and
-must restore the previous offset.  If it leaves the viewport parked at
-`offset+len==total', the next `ghostel--redraw' mistakes that for a
-libghostty scrollback-clear and triggers a full erase + rebuild — which
-would collapse all buffer markers to `point-min'.  Anchor a marker in
-scrollback, call cursor-position, redraw, and assert the marker held."
-  (let ((buf (generate-new-buffer " *ghostel-test-cursor-pos-vp*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (let* ((term (ghostel--new 5 80 1000))
-                 (inhibit-read-only t))
-            ;; Overflow the viewport so the buffer holds real scrollback.
-            (dotimes (i 12)
-              (ghostel--write-input term (format "row-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            ;; Anchor a marker on a scrolled-off row, well past `point-min'.
-            (goto-char (point-min))
-            (search-forward "row-00")
-            (let* ((target (point))
-                   (m (copy-marker target)))
-              (unwind-protect
-                  (progn
-                    (ghostel--cursor-position term)
-                    (ghostel--redraw term)
-                    (should (= target (marker-position m))))
-                (set-marker m nil)))))
-      (kill-buffer buf))))
 
 (ert-deftest ghostel-test-redraw-preserves-mark ()
   "`ghostel--redraw' must keep `mark' stable across the destructive ops.
@@ -367,6 +343,7 @@ attached."
   (let ((buf (generate-new-buffer " *ghostel-test-sb-url*")))
     (unwind-protect
         (with-current-buffer buf
+          (set-window-buffer (selected-window) (current-buffer))
           (ghostel-mode)
           (let* ((term (ghostel--new 5 80 1000))
                  (ghostel--term term)
@@ -532,6 +509,7 @@ unlike semi-char mode where it tracks the terminal cursor."
   (let ((buf (generate-new-buffer " *ghostel-test-emacs-pt*")))
     (unwind-protect
         (with-current-buffer buf
+          (set-window-buffer (selected-window) buf)
           (ghostel-mode)
           (setq ghostel--term (ghostel--new 5 80 1000))
           (setq ghostel--term-rows 5)
@@ -614,6 +592,7 @@ not clobbered."
   (let ((buf (generate-new-buffer " *ghostel-test-line-live*")))
     (unwind-protect
         (with-current-buffer buf
+          (set-window-buffer (selected-window) buf)
           (ghostel-mode)
           (setq ghostel--term (ghostel--new 5 80 1000))
           (setq ghostel--term-rows 5)
@@ -654,6 +633,115 @@ not clobbered."
             (should-not (text-property-any (point-min) (point-max)
                                            'read-only t))))
       (when (buffer-live-p buf) (kill-buffer buf)))))
+
+;; -----------------------------------------------------------------------
+;; Test: hidden buffer behavior
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-delayed-redraw-skips-native-redraw-without-window ()
+  "When the buffer has no window, `ghostel--delayed-redraw' must not call \
+`ghostel--redraw'."
+  (let ((buf (generate-new-buffer " *ghostel-test-no-window-redraw*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((ghostel--term t)
+                (redraw-called nil))
+            (cl-letf (((symbol-function 'ghostel--flush-pending-output) #'ignore)
+                      ((symbol-function 'ghostel--mode-enabled)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'ghostel--correct-mangled-scroll-positions)
+                       #'ignore)
+                      ((symbol-function 'ghostel--redraw)
+                       (lambda (&rest _) (setq redraw-called t)))
+                      ((symbol-function 'get-buffer-window-list)
+                       (lambda (&rest _) nil)))
+              (ghostel--delayed-redraw buf)
+              (should-not redraw-called))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-defers-redraw-while-hidden ()
+  "Buffer is not redrawn while hidden.
+When the buffer reappears, it is immediately redrawn."
+  (let* ((win (selected-window))
+         (orig-buf (window-buffer win))
+         (buf (generate-new-buffer " *ghostel-test-hidden-defer*")))
+    (unwind-protect
+        (progn
+          (set-window-buffer win buf)
+          (with-current-buffer buf
+            (ghostel-mode)
+            (let* ((term (ghostel--new 5 40 100))
+                   (ghostel--term term)
+                   (ghostel--term-rows 5)
+                   (inhibit-read-only t))
+              (ghostel--write-input term "initial\r\n")
+              (ghostel--redraw term t)
+              (should (string-match-p "initial" (buffer-string)))
+
+              ;; Hide the buffer.
+              (set-window-buffer win orig-buf)
+
+              ;; Output arrives while hidden but does not appear; make
+              ;; run-with-timer fire synchronously so no sleep is needed.
+              (ghostel--write-input term "while-hidden\r\n")
+              (cl-letf (((symbol-function 'run-with-timer)
+                         (lambda (_delay _repeat fn &rest args)
+                           (apply fn args) nil)))
+                (ghostel--invalidate))
+
+              ;; Redraw blocked: buffer still shows the old content.
+              (should-not (string-match-p "while-hidden" (buffer-string)))
+
+              ;; Reshow the buffer; hook calls ghostel--invalidate again.
+              (set-window-buffer win buf)
+              (cl-letf (((symbol-function 'run-with-timer)
+                         (lambda (_delay _repeat fn &rest args)
+                           (apply fn args) nil)))
+                (run-hook-with-args 'window-buffer-change-functions win))
+
+              (should (string-match-p "while-hidden" (buffer-string))))))
+      (set-window-buffer win orig-buf)
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-pty-output-is-processed-when-buffer-is-hidden ()
+  "Output is processed but not drawn while the buffer is hidden.
+When the buffer reappears, it is immediately redrawn."
+  (let* ((win (selected-window))
+         (orig-buf (window-buffer win))
+         (buf (generate-new-buffer " *ghostel-test-hidden-defer*")))
+    (unwind-protect
+        (progn
+          (set-window-buffer win buf)
+          (with-current-buffer buf
+            (ghostel-mode)
+            (let* ((term (ghostel--new 5 40 100))
+                   (ghostel--term term)
+                   (ghostel--term-rows 5)
+                   (inhibit-read-only t))
+              (ghostel--write-input term "initial\r\n")
+              (ghostel--redraw term t)
+              (should (string-match-p "initial" (buffer-string)))
+
+              ;; Hide the buffer.
+              (set-window-buffer win orig-buf)
+
+              ;; Simulate process output; make run-with-timer fire
+              ;; synchronously so no sleep is needed.
+              (cl-letf (((symbol-function 'run-with-timer)
+                         (lambda (_delay _repeat fn &rest args)
+                           (apply fn args) nil))
+                        ((symbol-function 'process-buffer)
+                         (lambda (_) buf)))
+                (ghostel--filter nil "while-hidden\r\n"))
+              (should-not (string-match-p "while-hidden" (buffer-string)))
+
+              ;; Output should have been processed so force redrawing should
+              ;; show it:
+              (ghostel--redraw term)
+              (should (string-match-p "while-hidden" (buffer-string))))))
+      (set-window-buffer win orig-buf)
+      (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: clear screen (ghostel-clear)
@@ -1684,6 +1772,62 @@ that collided with a fish-internal local variable, leaking
     (with-temp-buffer
       (ghostel-compile-view-mode)
       (should (equal list-buffers-directory default-directory)))))
+
+;; -----------------------------------------------------------------------
+;; Test: bash OSC 7 ignores $HOSTNAME (#276)
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-bash-osc7-ignores-env-hostname ()
+  "Bash OSC 7 must report gethostname(2), not $HOSTNAME (#276).
+
+Toolbox/container runtimes export HOSTNAME with a value that
+disagrees with the kernel hostname.  Emacs function `system-name'
+reads gethostname(2); if bash's integration emits $HOSTNAME the
+local-host comparison in `ghostel--update-directory' fails and
+the buffer is misclassified as remote, switching on TRAMP."
+  (skip-unless (executable-find "bash"))
+  ;; The test exercises the bash 4.4+ ${var@P} path.  On bash <4.4
+  ;; (notably macOS /bin/bash 3.2) the integration deliberately falls
+  ;; back to $HOSTNAME - pre-#276 behavior, no regression for those
+  ;; users - so the assertion below would not hold and the test would
+  ;; be testing the wrong invariant.
+  (let ((ver (with-temp-buffer
+               (call-process "bash" nil t nil "-c"
+                             "printf '%s.%s' \"$BASH_VERSINFO\" \"${BASH_VERSINFO[1]}\"")
+               (buffer-string))))
+    (skip-unless
+     (and (string-match "\\`\\([0-9]+\\)\\.\\([0-9]+\\)\\'" ver)
+          (let ((major (string-to-number (match-string 1 ver)))
+                (minor (string-to-number (match-string 2 ver))))
+            (or (> major 4) (and (= major 4) (>= minor 4)))))))
+  (let* ((root (or (ghostel--resource-root)
+                   (file-name-directory (locate-library "ghostel"))))
+         (shell-bash (expand-file-name "etc/shell/ghostel.bash" root)))
+    (skip-unless (file-exists-p shell-bash))
+    (let* ((fake "ghostel-test-fake-host-zzz")
+           (process-environment
+            (append (list (format "HOSTNAME=%s" fake)
+                          "INSIDE_EMACS=ghostel")
+                    process-environment))
+           (probe (format "cd /; source %s; __ghostel_osc7"
+                          shell-bash))
+           (output (with-temp-buffer
+                     (call-process "bash" nil (current-buffer) nil
+                                   "--noprofile" "--norc" "-c" probe)
+                     (buffer-string))))
+      ;; Probe emits: \e]7;file://HOST/\a
+      (should (string-match "\e\\]7;file://\\([^/]*\\)/" output))
+      (let ((emitted (match-string 1 output)))
+        ;; Polluted $HOSTNAME must not appear in the OSC 7 host.
+        (should-not (equal emitted fake))
+        ;; Whatever bash emits must pass the same locality check the elisp side
+        ;; applies in `ghostel--update-directory'.  Asserting the predicate
+        ;; (not strict equality with `system-name') is deliberate: on hosts
+        ;; where (system-name) is an FQDN but \H is the short form (or vice
+        ;; versa) the two strings differ, yet `ghostel--local-host-p' accepts
+        ;; either via its split- on-`.' fallback - which is exactly the
+        ;; production behavior we care about.
+        (should (ghostel--local-host-p emitted))))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: OSC 7 end-to-end through libghostty
@@ -3535,7 +3679,7 @@ below it."
                        (ghostel--flush-pending-output)
                        (let ((inhibit-read-only t))
                          (ghostel--redraw ghostel--term t))
-                       (let ((pos (ghostel--cursor-position ghostel--term))
+                       (let ((pos ghostel--cursor-pos)
                              (vp-start (ghostel--viewport-start)))
                          (and pos vp-start
                               (save-excursion
@@ -3547,7 +3691,7 @@ below it."
                                   (line-beginning-position)
                                   (line-end-position)))))))
                      15)
-                    (let* ((pos (ghostel--cursor-position ghostel--term))
+                    (let* ((pos ghostel--cursor-pos)
                            (col (car pos))
                            (row (cdr pos))
                            (vp-start (ghostel--viewport-start)))
@@ -4028,6 +4172,7 @@ a successful submission."
           (setq ghostel--term-rows 5)
           (setq ghostel--process 'fake-proc)
           (setq ghostel--password-mode-p t)
+          (ghostel--redraw ghostel--term)
           (let ((ghostel-password-prompt-functions
                  (list (lambda (_row) nil) (lambda (_row) nil))))
             (cl-letf (((symbol-function 'process-send-string)
@@ -4039,7 +4184,10 @@ a successful submission."
       (when (buffer-live-p buf) (kill-buffer buf)))))
 
 (ert-deftest ghostel-test-detect-password-prompt-fires-once-per-edge ()
-  "Hook fires on rising edge only; falling edge clears state."
+  "Hook fires on rising edge only; falling edge clears state.
+`ghostel-password-prompt-debounce' is set to 0 so the confirm timer
+fires on the next event-loop tick — the test is about edge logic,
+not the debounce window itself (covered separately)."
   (let* ((buf (generate-new-buffer " *ghostel-test-pwd-edge*"))
          (calls 0)
          (now nil))
@@ -4048,8 +4196,10 @@ a successful submission."
           (ghostel-mode)
           (setq ghostel--term (ghostel--new 5 80 1000))
           (setq ghostel--term-rows 5)
+          (ghostel--redraw ghostel--term)
           (let ((ghostel-password-prompt-functions
-                 (list (lambda (_row) (cl-incf calls) nil))))
+                 (list (lambda (_row) (cl-incf calls) nil)))
+                (ghostel-password-prompt-debounce 0))
             (cl-letf (((symbol-function 'ghostel--password-prompt-detected-p)
                        (lambda () now)))
               (setq now t)
@@ -4074,7 +4224,9 @@ a successful submission."
 Regression: sudo (and friends) hold the tty in canonical+!echo for
 tens of milliseconds after read() returns; the next PTY chunk would
 otherwise look like a fresh rising edge and pop a second
-`read-passwd' minibuffer."
+`read-passwd' minibuffer.  Debounce is set to 0 so the confirm
+timer fires on the next event-loop tick — this test is about the
+handled-row suppression, not the debounce window."
   (let* ((buf (generate-new-buffer " *ghostel-test-pwd-suppress*"))
          (calls 0))
     (unwind-protect
@@ -4083,11 +4235,11 @@ otherwise look like a fresh rising edge and pop a second
           (setq ghostel--term (ghostel--new 5 80 1000))
           (setq ghostel--term-rows 5)
           (let ((ghostel-password-prompt-functions
-                 (list (lambda (_row) (cl-incf calls) nil))))
+                 (list (lambda (_row) (cl-incf calls) nil)))
+                (ghostel-password-prompt-debounce 0))
             (cl-letf (((symbol-function 'ghostel--password-prompt-detected-p)
                        (lambda () t))
-                      ((symbol-function 'ghostel--cursor-position)
-                       (lambda (_term) '(0 . 2))))
+                      (ghostel--cursor-pos '(0 . 2)))
               ;; Initial rising edge fires once.
               (ghostel--detect-password-prompt)
               (sleep-for 0.05)
@@ -4106,12 +4258,244 @@ otherwise look like a fresh rising edge and pop a second
             ;; the next program's prompt).  Detector must re-fire.
             (cl-letf (((symbol-function 'ghostel--password-prompt-detected-p)
                        (lambda () t))
-                      ((symbol-function 'ghostel--cursor-position)
-                       (lambda (_term) '(0 . 4))))
+                      (ghostel--cursor-pos '(0 . 4)))
               (ghostel--detect-password-prompt)
               (sleep-for 0.05)
               (should (= 2 calls)))))
       (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest ghostel-test-password-debounce-defers-source-call ()
+  "Rising edge schedules a confirm timer; source is NOT called synchronously.
+The source runs only after the debounce elapses and the heuristic
+is re-confirmed (mirrors ghostty's ~200 ms termios polling cadence)."
+  (let* ((buf (generate-new-buffer " *ghostel-test-pwd-debounce-defer*"))
+         (calls 0))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (setq ghostel--term (ghostel--new 5 80 1000))
+          (setq ghostel--term-rows 5)
+          (ghostel--redraw ghostel--term)
+          (let ((ghostel-password-prompt-functions
+                 (list (lambda (_row) (cl-incf calls) "x")))
+                (ghostel-password-prompt-debounce 0.1))
+            (cl-letf (((symbol-function 'ghostel--password-prompt-detected-p)
+                       (lambda () t))
+                      ((symbol-function 'process-send-string)
+                       (lambda (_p _d) nil)))
+              (ghostel--detect-password-prompt)
+              (should ghostel--password-mode-p)
+              (should ghostel--password-confirm-timer)
+              (should (= 0 calls))
+              (sleep-for 0.25)
+              (should (= 1 calls))
+              (should-not ghostel--password-confirm-timer))))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest ghostel-test-password-debounce-cancels-on-sub-debounce-flicker ()
+  "Sub-debounce flicker cancels the confirm timer; source is never called.
+This is the false-positive defense that mirrors ghostty's natural
+undersampling — a canonical+!echo flip shorter than the debounce
+window never reaches the user."
+  (let* ((buf (generate-new-buffer " *ghostel-test-pwd-debounce-flicker*"))
+         (calls 0)
+         (now t))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (setq ghostel--term (ghostel--new 5 80 1000))
+          (setq ghostel--term-rows 5)
+          (ghostel--redraw ghostel--term)
+          (let ((ghostel-password-prompt-functions
+                 (list (lambda (_row) (cl-incf calls) "x")))
+                (ghostel-password-prompt-debounce 0.5))
+            (cl-letf (((symbol-function 'ghostel--password-prompt-detected-p)
+                       (lambda () now)))
+              (ghostel--detect-password-prompt)
+              (should ghostel--password-confirm-timer)
+              (should ghostel--password-mode-p)
+              ;; Falling edge before timer fires.
+              (setq now nil)
+              (ghostel--detect-password-prompt)
+              (should-not ghostel--password-confirm-timer)
+              (should-not ghostel--password-mode-p)
+              (sleep-for 0.6)
+              (should (= 0 calls)))))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest ghostel-test-cancel-password-prompt-depth-gate ()
+  "`ghostel--cancel-password-prompt' aborts only when depth is outer+1.
+Other depths (no minibuffer, equal to outer, or deeper) are no-ops
+so unrelated minibuffers (e.g. `M-x' the user opened before the
+rising edge) survive.  The minibuffer-identity gate is satisfied
+by stubbing `active-minibuffer-window' + `window-buffer' to return
+the same buffer we set as `ghostel--password-prompt-mb-buffer'."
+  (let ((buf (generate-new-buffer " *ghostel-test-pwd-cancel-gate*"))
+        (mb-buf (generate-new-buffer " *ghostel-test-pwd-mb*"))
+        (aborted 0)
+        (depth 0))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (cl-letf (((symbol-function 'minibuffer-depth) (lambda () depth))
+                    ((symbol-function 'active-minibuffer-window)
+                     (lambda () 'fake-window))
+                    ((symbol-function 'window-buffer)
+                     (lambda (_w) mb-buf))
+                    ((symbol-function 'abort-recursive-edit)
+                     (lambda () (cl-incf aborted))))
+            (setq ghostel--password-prompt-mb-buffer mb-buf)
+            ;; Flag off → no abort regardless of depth.
+            (setq ghostel--password-prompt-active nil
+                  ghostel--password-prompt-outer-depth 0
+                  depth 1)
+            (ghostel--cancel-password-prompt)
+            (should (= 0 aborted))
+            ;; Flag on, depth == outer (prompt not yet opened) → no abort.
+            (setq ghostel--password-prompt-active t
+                  ghostel--password-prompt-outer-depth 1
+                  depth 1)
+            (ghostel--cancel-password-prompt)
+            (should (= 0 aborted))
+            ;; Flag on, depth == outer+1 → our minibuffer is innermost; abort.
+            (setq depth 2)
+            (ghostel--cancel-password-prompt)
+            (should (= 1 aborted))
+            ;; Flag on, depth > outer+1 (something stacked on top) → no abort.
+            (setq depth 3)
+            (ghostel--cancel-password-prompt)
+            (should (= 1 aborted))))
+      (when (buffer-live-p buf) (kill-buffer buf))
+      (when (buffer-live-p mb-buf) (kill-buffer mb-buf)))))
+
+(ert-deftest ghostel-test-cancel-password-prompt-mb-identity-gate ()
+  "Identity gate blocks abort when the active minibuffer isn't ours.
+Stub setup: depth=1, outer=0 (so depth gate passes).  The cancel
+fires only when `(window-buffer (active-minibuffer-window))' equals
+`ghostel--password-prompt-mb-buffer' — i.e. the active minibuffer
+is the one our setup hook captured.  Covers two failure modes:
+  - Captured nil (our chain ran but never opened a minibuffer);
+  - Active minibuffer is some other buffer (cross-buffer race or
+    nested minibuffer that pushed us off the innermost slot)."
+  (let ((buf (generate-new-buffer " *ghostel-test-pwd-mb-gate*"))
+        (our-mb (generate-new-buffer " *ghostel-test-pwd-our-mb*"))
+        (other-mb (generate-new-buffer " *ghostel-test-pwd-other-mb*"))
+        (aborted 0)
+        (active-mb-buf nil))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (cl-letf (((symbol-function 'minibuffer-depth) (lambda () 1))
+                    ((symbol-function 'active-minibuffer-window)
+                     (lambda () (and active-mb-buf 'fake-window)))
+                    ((symbol-function 'window-buffer)
+                     (lambda (_w) active-mb-buf))
+                    ((symbol-function 'abort-recursive-edit)
+                     (lambda () (cl-incf aborted))))
+            (setq ghostel--password-prompt-active t
+                  ghostel--password-prompt-outer-depth 0)
+            ;; Captured nil → never abort.
+            (setq ghostel--password-prompt-mb-buffer nil
+                  active-mb-buf our-mb)
+            (ghostel--cancel-password-prompt)
+            (should (= 0 aborted))
+            ;; Captured but active minibuffer is a different buffer → no abort.
+            (setq ghostel--password-prompt-mb-buffer our-mb
+                  active-mb-buf other-mb)
+            (ghostel--cancel-password-prompt)
+            (should (= 0 aborted))
+            ;; Captured matches active minibuffer → abort.
+            (setq active-mb-buf our-mb)
+            (ghostel--cancel-password-prompt)
+            (should (= 1 aborted))
+            ;; No active minibuffer at all → no abort.
+            (setq active-mb-buf nil)
+            (ghostel--cancel-password-prompt)
+            (should (= 1 aborted))))
+      (when (buffer-live-p buf) (kill-buffer buf))
+      (when (buffer-live-p our-mb) (kill-buffer our-mb))
+      (when (buffer-live-p other-mb) (kill-buffer other-mb)))))
+
+(ert-deftest ghostel-test-prompt-password-mb-buffer-capture ()
+  "Setup hook in `ghostel--prompt-password' captures the right minibuffer.
+The lambda installed by `minibuffer-with-setup-hook' must set
+`ghostel--password-prompt-mb-buffer' only when the minibuffer was
+entered from the origin buffer's window — an unrelated minibuffer
+opened concurrently (cross-buffer race) must not poison the
+capture.  Drives `minibuffer-setup-hook' directly from a stubbed
+source so the hook fires under controlled conditions without
+involving a real `read-passwd' call, and snapshots
+`ghostel--password-prompt-mb-buffer' before the unwind clears it."
+  (let ((origin (generate-new-buffer " *ghostel-test-pwd-capture-origin*"))
+        (mb (generate-new-buffer " *ghostel-test-pwd-capture-mb*"))
+        (other (generate-new-buffer " *ghostel-test-pwd-capture-other*"))
+        (snapshot 'sentinel))
+    (unwind-protect
+        (with-current-buffer origin
+          (ghostel-mode)
+          (setq ghostel--process 'fake-proc)
+          (cl-letf (((symbol-function 'processp) (lambda (_p) t))
+                    ((symbol-function 'process-live-p) (lambda (_p) t))
+                    ((symbol-function 'process-send-string) (lambda (_p _d) nil)))
+            ;; Case 1: minibuffer entered from ORIGIN → capture.
+            (let ((ghostel-password-prompt-functions
+                   (list (lambda (_row)
+                           (with-current-buffer mb
+                             (cl-letf (((symbol-function 'minibuffer-selected-window)
+                                        (lambda () 'fake-win))
+                                       ((symbol-function 'window-buffer)
+                                        (lambda (_w) origin)))
+                               (run-hooks 'minibuffer-setup-hook)))
+                           (setq snapshot ghostel--password-prompt-mb-buffer)
+                           "x"))))
+              (ghostel--prompt-password))
+            (should (eq snapshot mb))
+            ;; Case 2: minibuffer entered from a different buffer → no capture.
+            (setq snapshot 'sentinel)
+            (let ((ghostel-password-prompt-functions
+                   (list (lambda (_row)
+                           (with-current-buffer mb
+                             (cl-letf (((symbol-function 'minibuffer-selected-window)
+                                        (lambda () 'fake-win))
+                                       ((symbol-function 'window-buffer)
+                                        (lambda (_w) other)))
+                               (run-hooks 'minibuffer-setup-hook)))
+                           (setq snapshot ghostel--password-prompt-mb-buffer)
+                           "x"))))
+              (ghostel--prompt-password))
+            (should-not snapshot)))
+      (when (buffer-live-p origin) (kill-buffer origin))
+      (when (buffer-live-p mb) (kill-buffer mb))
+      (when (buffer-live-p other) (kill-buffer other)))))
+
+(ert-deftest ghostel-test-password-detect-aborts-on-falling-edge ()
+  "Falling edge with prompt active and right depth calls `abort-recursive-edit'.
+Routes through `ghostel--cancel-password-prompt' from the falling-edge
+branch of `ghostel--detect-password-prompt'.  Identity gate is
+satisfied by setting `ghostel--password-prompt-mb-buffer' and
+stubbing `active-minibuffer-window' / `window-buffer' to return it."
+  (let ((buf (generate-new-buffer " *ghostel-test-pwd-falling-abort*"))
+        (mb-buf (generate-new-buffer " *ghostel-test-pwd-falling-mb*"))
+        (aborted 0))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (cl-letf (((symbol-function 'ghostel--password-prompt-detected-p)
+                     (lambda () nil))
+                    ((symbol-function 'minibuffer-depth) (lambda () 1))
+                    ((symbol-function 'active-minibuffer-window)
+                     (lambda () 'fake-window))
+                    ((symbol-function 'window-buffer)
+                     (lambda (_w) mb-buf))
+                    ((symbol-function 'abort-recursive-edit)
+                     (lambda () (cl-incf aborted))))
+            (setq ghostel--password-prompt-active t
+                  ghostel--password-prompt-outer-depth 0
+                  ghostel--password-prompt-mb-buffer mb-buf)
+            (ghostel--detect-password-prompt)
+            (should (= 1 aborted))))
+      (when (buffer-live-p buf) (kill-buffer buf))
+      (when (buffer-live-p mb-buf) (kill-buffer mb-buf)))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: ghostel-command-finish-functions hook
@@ -5156,8 +5540,7 @@ custom MODE / NAME-FUNCTION / HIGHLIGHT-REGEXP survive a revert."
               ((symbol-function 'ghostel--new) (lambda (&rest _) 'fake))
               ((symbol-function 'ghostel--apply-palette) #'ignore)
               ((symbol-function 'ghostel--set-size) #'ignore)
-              ((symbol-function 'ghostel--cursor-position)
-               (lambda (_) (cons 0 0)))
+              (ghostel--cursor-pos (cons 0 0))
               ((symbol-function 'ghostel-compile--render-header-live)
                #'ignore)
               ((symbol-function 'ghostel-compile--spawn)
@@ -5192,8 +5575,7 @@ custom MODE / NAME-FUNCTION / HIGHLIGHT-REGEXP survive a revert."
               ((symbol-function 'ghostel--new) (lambda (&rest _) 'fake))
               ((symbol-function 'ghostel--apply-palette) #'ignore)
               ((symbol-function 'ghostel--set-size) #'ignore)
-              ((symbol-function 'ghostel--cursor-position)
-               (lambda (_) (cons 0 0)))
+              (ghostel--cursor-pos (cons 0 0))
               ((symbol-function 'ghostel-compile--render-header-live)
                #'ignore)
               ((symbol-function 'ghostel-compile--spawn)
@@ -5519,8 +5901,7 @@ the same dimensions so PTY and VT always agree."
                       (push (list rows cols) set-size-calls)))
                    ((symbol-function 'ghostel-compile--render-header-live)
                     (lambda (&rest _) (push 'render-header call-order)))
-                   ((symbol-function 'ghostel--cursor-position)
-                    (lambda (_term) (cons 0 0)))
+                   (ghostel--cursor-pos (cons 0 0))
                    ((symbol-function 'ghostel-compile--spawn)
                     (lambda (_cmd buf h w)
                       (push 'spawn call-order)
@@ -5584,8 +5965,7 @@ dimensions when no output window exists."
                     (lambda (&rest _) (setq set-size-called t)))
                    ((symbol-function 'ghostel-compile--render-header-live)
                     #'ignore)
-                   ((symbol-function 'ghostel--cursor-position)
-                    (lambda (_term) (cons 0 0)))
+                   (ghostel--cursor-pos (cons 0 0))
                    ((symbol-function 'ghostel-compile--spawn)
                     (lambda (_cmd buf _h _w)
                       (let ((p (start-process "ghostel-test-nowin-fake"
@@ -5975,6 +6355,7 @@ for new size inside BSU/ESU → verify buffer shows new content."
   (let ((buf (generate-new-buffer " *ghostel-test-resize-redraw*")))
     (unwind-protect
         (with-current-buffer buf
+          (set-window-buffer (selected-window) (current-buffer))
           (ghostel-mode)
           (let* ((term (ghostel--new 10 40 100))
                  (ghostel--term term)
@@ -7362,6 +7743,7 @@ app redraws all rows at new width via the filter pipeline."
   (let ((buf (generate-new-buffer " *ghostel-test-width-change*")))
     (unwind-protect
         (with-current-buffer buf
+          (set-window-buffer (selected-window) (current-buffer))
           (ghostel-mode)
           (setq ghostel--term (ghostel--new 6 80 100))
           (let* ((proc (start-process "ghostel-test-w" buf "sleep" "60"))
@@ -7423,6 +7805,7 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
   (let ((buf (generate-new-buffer " *ghostel-test-pipeline*")))
     (unwind-protect
         (with-current-buffer buf
+          (set-window-buffer (selected-window) (current-buffer))
           (ghostel-mode)
           (setq ghostel--term (ghostel--new 10 40 100))
           (let* ((process-environment
@@ -7492,7 +7875,7 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
     (cl-letf (((symbol-function 'ghostel--apply-palette)
                (lambda (term) (push term palette-calls)))
               ((symbol-function 'ghostel--redraw)
-               (lambda (term) (push term redraw-calls)))
+               (lambda (term _) (push term redraw-calls)))
               ((symbol-function 'ghostel--schedule-link-detection)
                (lambda (&rest _args)
                  (setq post-process-calls (1+ post-process-calls)))))
@@ -7507,6 +7890,7 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
                 (setq ghostel--term 'fake-term)
                 (setq ghostel--input-mode 'semi-char)
                 (setq ghostel-enable-url-detection t))
+              (set-window-buffer (selected-window) buf)
               ;; `other' is not a ghostel buffer and should be ignored.
               (ghostel-sync-theme)
               (should (memq 'fake-term palette-calls))
@@ -7719,6 +8103,236 @@ hand nil to the native module."
         (with-current-buffer buf
           (kill-local-variable 'global-hl-line-mode))
         (kill-buffer buf)))))
+
+;; -----------------------------------------------------------------------
+;; Test: read-only-mode hint cursor (fake cursor)
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-fake-cursor-style-resolution ()
+  "`ghostel--fake-cursor-style' maps `cursor-in-non-selected-windows'."
+  (with-temp-buffer
+    (let ((cursor-in-non-selected-windows nil))
+      (should (null (ghostel--fake-cursor-style))))
+    (let ((cursor-in-non-selected-windows 'hollow))
+      (should (eq 'hollow (ghostel--fake-cursor-style))))
+    (let ((cursor-in-non-selected-windows 'box))
+      (should (eq 'box (ghostel--fake-cursor-style))))
+    (let ((cursor-in-non-selected-windows '(box . 4)))
+      (should (eq 'box (ghostel--fake-cursor-style))))
+    ;; bar / hbar fall back to hollow
+    (let ((cursor-in-non-selected-windows 'bar))
+      (should (eq 'hollow (ghostel--fake-cursor-style))))
+    (let ((cursor-in-non-selected-windows '(bar . 2)))
+      (should (eq 'hollow (ghostel--fake-cursor-style))))
+    (let ((cursor-in-non-selected-windows 'hbar))
+      (should (eq 'hollow (ghostel--fake-cursor-style))))
+    ;; t with a saved box cursor-type → hollow
+    (setq-local ghostel--saved-cursor-type 'box)
+    (let ((cursor-in-non-selected-windows t))
+      (should (eq 'hollow (ghostel--fake-cursor-style))))
+    ;; t with no saved cursor-type → nil (terminal hid the cursor)
+    (setq-local ghostel--saved-cursor-type nil)
+    (let ((cursor-in-non-selected-windows t))
+      (should (null (ghostel--fake-cursor-style))))))
+
+(ert-deftest ghostel-test-fake-cursor-overlay-when-point-off-cursor ()
+  "Overlay appears at the live cursor position when point is elsewhere."
+  (with-temp-buffer
+    (insert "abcdef\nghijkl")
+    (setq-local ghostel--term 'fake)
+    (setq-local ghostel--input-mode 'copy)
+    (setq-local ghostel--saved-cursor-type 'box)
+    (let ((ghostel-readonly-fake-cursor t)
+          (cursor-in-non-selected-windows 'hollow))
+      (setq-local ghostel--cursor-char-pos 5)
+      (goto-char 1)
+      (ghostel--fake-cursor-update)
+      (should ghostel--fake-cursor-overlay)
+      (should (= 5 (overlay-start ghostel--fake-cursor-overlay)))
+      (should (= 6 (overlay-end ghostel--fake-cursor-overlay)))
+      (should (eq 'ghostel-fake-cursor
+                  (overlay-get ghostel--fake-cursor-overlay 'face))))))
+
+(ert-deftest ghostel-test-fake-cursor-cleared-when-point-coincides ()
+  "Overlay is removed when point lands on the live cursor position."
+  (with-temp-buffer
+    (insert "abcdef\nghijkl")
+    (setq-local ghostel--term 'fake)
+    (setq-local ghostel--input-mode 'copy)
+    (setq-local ghostel--saved-cursor-type 'box)
+    (let ((ghostel-readonly-fake-cursor t)
+          (cursor-in-non-selected-windows 'hollow))
+      (setq-local ghostel--cursor-char-pos 5)
+      (goto-char 1)
+      (ghostel--fake-cursor-update)
+      (should ghostel--fake-cursor-overlay)
+      (goto-char 5)
+      (ghostel--fake-cursor-update)
+      (should-not ghostel--fake-cursor-overlay))))
+
+(ert-deftest ghostel-test-fake-cursor-disabled-by-defcustom ()
+  "No overlay is created when `ghostel-readonly-fake-cursor' is nil."
+  (with-temp-buffer
+    (insert "abcdef")
+    (setq-local ghostel--term 'fake)
+    (setq-local ghostel--input-mode 'copy)
+    (setq-local ghostel--saved-cursor-type 'box)
+    (let ((ghostel-readonly-fake-cursor nil)
+          (cursor-in-non-selected-windows 'hollow))
+      (setq-local ghostel--cursor-char-pos 5)
+      (goto-char 1)
+      (ghostel--fake-cursor-update)
+      (should-not ghostel--fake-cursor-overlay))))
+
+(ert-deftest ghostel-test-fake-cursor-disabled-by-cinsw ()
+  "No overlay when `cursor-in-non-selected-windows' resolves to nil."
+  (with-temp-buffer
+    (insert "abcdef")
+    (setq-local ghostel--term 'fake)
+    (setq-local ghostel--input-mode 'copy)
+    (setq-local ghostel--saved-cursor-type 'box)
+    (let ((ghostel-readonly-fake-cursor t)
+          (cursor-in-non-selected-windows nil))
+      (setq-local ghostel--cursor-char-pos 5)
+      (goto-char 1)
+      (ghostel--fake-cursor-update)
+      (should-not ghostel--fake-cursor-overlay))))
+
+(ert-deftest ghostel-test-fake-cursor-not-in-semi-char ()
+  "No overlay outside copy / Emacs mode."
+  (with-temp-buffer
+    (insert "abcdef")
+    (setq-local ghostel--term 'fake)
+    (setq-local ghostel--saved-cursor-type 'box)
+    (let ((ghostel-readonly-fake-cursor t)
+          (cursor-in-non-selected-windows 'hollow))
+      (setq-local ghostel--cursor-char-pos 5)
+      (dolist (mode '(semi-char char line))
+        (setq-local ghostel--input-mode mode)
+        (goto-char 1)
+        (ghostel--fake-cursor-update)
+        (should-not ghostel--fake-cursor-overlay)))))
+
+(ert-deftest ghostel-test-fake-cursor-box-style-uses-box-face ()
+  "`box' resolution paints with the solid face."
+  (with-temp-buffer
+    (insert "abcdef")
+    (setq-local ghostel--term 'fake)
+    (setq-local ghostel--input-mode 'copy)
+    (setq-local ghostel--saved-cursor-type 'box)
+    (let ((ghostel-readonly-fake-cursor t)
+          (cursor-in-non-selected-windows 'box))
+      (setq-local ghostel--cursor-char-pos 5)
+      (goto-char 1)
+      (ghostel--fake-cursor-update)
+      (should (eq 'ghostel-fake-cursor-box
+                  (overlay-get ghostel--fake-cursor-overlay 'face))))))
+
+(ert-deftest ghostel-test-fake-cursor-eol-uses-after-string ()
+  "At end-of-line / end-of-buffer, the overlay uses an after-string."
+  (with-temp-buffer
+    (insert "abc")                    ; eob = 4
+    (setq-local ghostel--term 'fake)
+    (setq-local ghostel--input-mode 'copy)
+    (setq-local ghostel--saved-cursor-type 'box)
+    (let ((ghostel-readonly-fake-cursor t)
+          (cursor-in-non-selected-windows 'hollow))
+      (setq-local ghostel--cursor-char-pos 4)
+      (goto-char 1)
+      (ghostel--fake-cursor-update)
+      (should ghostel--fake-cursor-overlay)
+      (let ((after (overlay-get ghostel--fake-cursor-overlay 'after-string)))
+        (should (stringp after))
+        (should (eq 'ghostel-fake-cursor
+                    (get-text-property 0 'face after))))
+      (should (null (overlay-get ghostel--fake-cursor-overlay 'face))))))
+
+(ert-deftest ghostel-test-fake-cursor-cleared-on-leave-readonly ()
+  "`ghostel--leave-readonly-state' clears the overlay and the hook."
+  (with-temp-buffer
+    (insert "abcdef")
+    (setq-local ghostel--term 'fake)
+    (setq-local ghostel--input-mode 'copy)
+    (setq-local ghostel--saved-cursor-type 'box)
+    (let ((ghostel-readonly-fake-cursor t)
+          (cursor-in-non-selected-windows 'hollow))
+      (setq-local ghostel--cursor-char-pos 5)
+      (goto-char 1)
+      (add-hook 'pre-redisplay-functions #'ghostel--fake-cursor-update nil t)
+      (ghostel--fake-cursor-update)
+      (should ghostel--fake-cursor-overlay)
+      (should (memq #'ghostel--fake-cursor-update pre-redisplay-functions))
+      (ghostel--leave-readonly-state)
+      (should-not ghostel--fake-cursor-overlay)
+      (should-not (memq #'ghostel--fake-cursor-update pre-redisplay-functions)))))
+
+(ert-deftest ghostel-test-fake-cursor-toggles-between-eol-and-mid-line ()
+  "Same overlay flips between `face' and `after-string' as it crosses EOL."
+  (with-temp-buffer
+    (insert "abcdef\nghijkl")          ; eol of line 1 = 7
+    (setq-local ghostel--term 'fake)
+    (setq-local ghostel--input-mode 'copy)
+    (setq-local ghostel--saved-cursor-type 'box)
+    (let ((ghostel-readonly-fake-cursor t)
+          (cursor-in-non-selected-windows 'hollow))
+      (setq-local ghostel--cursor-char-pos 3)
+      (goto-char 1)
+      ;; Mid-line: face set, no after-string.
+      (ghostel--fake-cursor-update)
+      (let ((ov ghostel--fake-cursor-overlay))
+        (should ov)
+        (should (eq 'ghostel-fake-cursor (overlay-get ov 'face)))
+        (should-not (overlay-get ov 'after-string))
+        ;; Move live cursor to EOL: same overlay flips to after-string.
+        (setq ghostel--cursor-char-pos 7)
+        (ghostel--fake-cursor-update)
+        (should (eq ov ghostel--fake-cursor-overlay))
+        (should-not (overlay-get ov 'face))
+        (should (stringp (overlay-get ov 'after-string)))
+        ;; Move back to mid-line: flips back.
+        (setq ghostel--cursor-char-pos 4)
+        (ghostel--fake-cursor-update)
+        (should (eq ov ghostel--fake-cursor-overlay))
+        (should (eq 'ghostel-fake-cursor (overlay-get ov 'face)))
+        (should-not (overlay-get ov 'after-string))))))
+
+(ert-deftest ghostel-test-fake-cursor-reuses-overlay-across-positions ()
+  "Successive updates with different positions reuse one overlay."
+  (with-temp-buffer
+    (insert "abcdef")
+    (setq-local ghostel--term 'fake)
+    (setq-local ghostel--input-mode 'copy)
+    (setq-local ghostel--saved-cursor-type 'box)
+    (let ((ghostel-readonly-fake-cursor t)
+          (cursor-in-non-selected-windows 'hollow))
+      (setq-local ghostel--cursor-char-pos 3)
+      (goto-char 1)
+      (ghostel--fake-cursor-update)
+      (let ((ov ghostel--fake-cursor-overlay))
+        (should ov)
+        (should (= 3 (overlay-start ov)))
+        (setq ghostel--cursor-char-pos 5)
+        (ghostel--fake-cursor-update)
+        (should (eq ov ghostel--fake-cursor-overlay))
+        (should (= 5 (overlay-start ov)))))))
+
+(ert-deftest ghostel-test-fake-cursor-clears-when-term-nil ()
+  "Overlay is cleared when `ghostel--term' becomes nil (process exit)."
+  (with-temp-buffer
+    (insert "abcdef")
+    (setq-local ghostel--term 'fake)
+    (setq-local ghostel--input-mode 'copy)
+    (setq-local ghostel--saved-cursor-type 'box)
+    (let ((ghostel-readonly-fake-cursor t)
+          (cursor-in-non-selected-windows 'hollow))
+      (setq-local ghostel--cursor-char-pos 5)
+      (goto-char 1)
+      (ghostel--fake-cursor-update)
+      (should ghostel--fake-cursor-overlay)
+      (setq-local ghostel--term nil)
+      (setq-local ghostel--cursor-char-pos nil)
+      (ghostel--fake-cursor-update)
+      (should-not ghostel--fake-cursor-overlay))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: ghostel-project buffer naming
@@ -7986,25 +8600,29 @@ hand nil to the native module."
 
 (ert-deftest ghostel-test-download-module-defaults-to-minimum-version ()
   "Automatic downloads pin to the minimum supported native module version."
-  (let ((ghostel--minimum-module-version "0.7.1")
-        (captured-version :unset)
-        (download-dest nil))
-    (cl-letf (((symbol-function 'ghostel--module-download-url)
-               (lambda (&optional version)
-                 (setq captured-version version)
-                 "https://example.invalid/releases/download/v0.7.1/ghostel-module-x86_64-linux.so"))
-              ((symbol-function 'ghostel--download-file)
-               (lambda (_url dest)
-                 (setq download-dest dest)
-                 t))
-              ((symbol-function 'message)
-               (lambda (&rest _))))
-      (should (ghostel--download-module "C:/ghostel/"))
-      (should (equal "0.7.1" captured-version))
-      (should (equal (downcase (expand-file-name
-                                (concat "ghostel-module" module-file-suffix)
-                                "C:/ghostel/"))
-                     (downcase download-dest))))))
+  (let* ((ghostel--minimum-module-version "0.7.1")
+         (captured-version :unset)
+         (download-dest nil)
+         (dir (make-temp-file "ghostel-dl-" t)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'ghostel--module-download-url)
+                   (lambda (&optional version)
+                     (setq captured-version version)
+                     "https://example.invalid/releases/download/v0.7.1/ghostel-module-x86_64-linux.so"))
+                  ((symbol-function 'ghostel--download-file)
+                   (lambda (_url dest)
+                     (setq download-dest dest)
+                     t))
+                  ((symbol-function 'message)
+                   (lambda (&rest _))))
+          (should (ghostel--download-module dir))
+          (should (equal "0.7.1" captured-version))
+          (should (equal (downcase (expand-file-name
+                                    (concat "ghostel-module" module-file-suffix)
+                                    dir))
+                         (downcase download-dest))))
+      (when (file-exists-p dir)
+        (delete-directory dir t)))))
 
 (ert-deftest ghostel-test-download-module-prefix-uses-requested-version ()
   "Prefix downloads pass the requested release version through unchanged."
@@ -8057,14 +8675,172 @@ hand nil to the native module."
         (should (null captured-version))
         (should captured-latest)))))
 
+(ert-deftest ghostel-test-download-file-is-atomic ()
+  "`ghostel--download-file' writes via a temp sibling and renames into place.
+The destination inode must change so any Emacs that has the previous
+file mmap'd keeps a valid mapping (issue #247)."
+  (let* ((dir (make-temp-file "ghostel-dl-" t))
+         (dest (expand-file-name "ghostel-module.so" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file dest (insert "old-payload"))
+          (set-file-modes dest #o644)
+          (let ((old-inode (file-attribute-inode-number (file-attributes dest))))
+            (cl-letf (((symbol-function 'url-retrieve-synchronously)
+                       (lambda (&rest _)
+                         (let ((buf (generate-new-buffer " *ghostel-fake-http*")))
+                           (with-current-buffer buf
+                             (set-buffer-multibyte nil)
+                             (insert "HTTP/1.1 200 OK\r\n\r\nnew-payload"))
+                           buf))))
+              (should (ghostel--download-file "https://example.invalid/x" dest)))
+            (should (equal "new-payload"
+                           (with-temp-buffer
+                             (set-buffer-multibyte nil)
+                             (insert-file-contents-literally dest)
+                             (buffer-string))))
+            (let ((new-inode (file-attribute-inode-number (file-attributes dest))))
+              (should-not (equal old-inode new-inode)))
+            ;; No stale temp files left behind on success.
+            (dolist (f (directory-files dir nil "\\." t))
+              (should-not (string-match-p "\\.tmp\\." f)))))
+      (when (file-exists-p dir)
+        (delete-directory dir t)))))
+
+(ert-deftest ghostel-test-download-module-creates-missing-directory ()
+  "`ghostel--download-module' creates DIR before writing the module.
+Regression for the auto-install path: setting `ghostel-module-directory'
+to a path that does not yet exist used to fail silently because the
+temp-file write under that directory errored out."
+  (let* ((parent (make-temp-file "ghostel-dl-parent-" t))
+         (dir (expand-file-name "sub/dir/" parent))
+         (asset "ghostel-module-x86_64-linux.so"))
+    (unwind-protect
+        (progn
+          (should-not (file-exists-p dir))
+          (cl-letf (((symbol-function 'ghostel--module-asset-name)
+                     (lambda () asset))
+                    ((symbol-function 'url-retrieve-synchronously)
+                     (lambda (&rest _)
+                       (let ((buf (generate-new-buffer " *ghostel-fake-http*")))
+                         (with-current-buffer buf
+                           (set-buffer-multibyte nil)
+                           (insert "HTTP/1.1 200 OK\r\n\r\npayload"))
+                         buf))))
+            (should (ghostel--download-module dir nil t)))
+          (should (file-directory-p dir))
+          (should (file-exists-p (expand-file-name
+                                  (concat "ghostel-module" module-file-suffix)
+                                  dir))))
+      (when (file-exists-p parent)
+        (delete-directory parent t)))))
+
+(ert-deftest ghostel-test-download-file-cleans-up-on-failure ()
+  "A failed HTTP response leaves no stale temp file behind."
+  (let* ((dir (make-temp-file "ghostel-dl-" t))
+         (dest (expand-file-name "ghostel-module.so" dir)))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'url-retrieve-synchronously)
+                     (lambda (&rest _)
+                       (let ((buf (generate-new-buffer " *ghostel-fake-http*")))
+                         (with-current-buffer buf
+                           (set-buffer-multibyte nil)
+                           (insert "HTTP/1.1 404 Not Found\r\n\r\nnope"))
+                         buf))))
+            (should-not (ghostel--download-file "https://example.invalid/x" dest)))
+          (should-not (file-exists-p dest))
+          (dolist (f (directory-files dir nil "\\." t))
+            (should-not (string-match-p "\\.tmp\\." f))))
+      (when (file-exists-p dir)
+        (delete-directory dir t)))))
+
+(ert-deftest ghostel-test-module-directory-defaults-to-resource-root ()
+  "When `ghostel-module-directory' is nil, the resource root is used."
+  (let ((ghostel-module-directory nil))
+    (cl-letf (((symbol-function 'ghostel--resource-root)
+               (lambda () "/pkg/ghostel/")))
+      (should (equal (downcase (file-name-as-directory
+                                (expand-file-name "/pkg/ghostel/")))
+                     (downcase (ghostel--module-directory)))))))
+
+(ert-deftest ghostel-test-module-directory-honours-custom-value ()
+  "When set, `ghostel-module-directory' takes precedence."
+  (let ((ghostel-module-directory "~/custom/ghostel/"))
+    (cl-letf (((symbol-function 'ghostel--resource-root)
+               (lambda () "/pkg/ghostel/")))
+      (should (equal (downcase (file-name-as-directory
+                                (expand-file-name "~/custom/ghostel/")))
+                     (downcase (ghostel--module-directory)))))))
+
+(ert-deftest ghostel-test-download-module-targets-custom-directory ()
+  "Interactive download writes into `ghostel-module-directory' when set."
+  (let ((ghostel-module-directory "/custom/dir/")
+        (captured-dir nil))
+    (let ((native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'ghostel--resource-root)
+                 (lambda () "/pkg/ghostel/"))
+                ((symbol-function 'file-exists-p)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'make-directory)
+                 (lambda (&rest _)))
+                ((symbol-function 'ghostel--read-module-download-version)
+                 (lambda () nil))
+                ((symbol-function 'ghostel--download-module)
+                 (lambda (dir &optional _v _l)
+                   (setq captured-dir dir)
+                   (throw 'ghostel-test-bail nil)))
+                ((symbol-function 'message)
+                 (lambda (&rest _))))
+        (catch 'ghostel-test-bail
+          (ghostel-download-module nil))
+        (should (equal (downcase (file-name-as-directory
+                                  (expand-file-name "/custom/dir/")))
+                       (downcase captured-dir)))))))
+
+(ert-deftest ghostel-test-load-module-looks-in-custom-directory ()
+  "`ghostel--load-module' loads the module from `ghostel-module-directory'."
+  (let* ((ghostel-module-directory "/custom/dir/")
+         (loaded-path nil)
+         (had-feat (featurep 'ghostel-module))
+         (saved-new (and (fboundp 'ghostel--new)
+                         (symbol-function 'ghostel--new))))
+    (unwind-protect
+        (progn
+          (when had-feat
+            (setq features (delq 'ghostel-module features)))
+          (when saved-new
+            (fmakunbound 'ghostel--new))
+          (cl-letf (((symbol-function 'ghostel--resource-root)
+                     (lambda () "/pkg/ghostel/"))
+                    ((symbol-function 'file-exists-p)
+                     (lambda (path)
+                       (string-prefix-p (expand-file-name "/custom/dir/") path)))
+                    ((symbol-function 'module-load)
+                     (lambda (path) (setq loaded-path path)))
+                    ((symbol-function 'ghostel--check-module-version)
+                     (lambda (&rest _))))
+            (ghostel--load-module)))
+      (when saved-new
+        (fset 'ghostel--new saved-new))
+      (when had-feat
+        (cl-pushnew 'ghostel-module features)))
+    (should loaded-path)
+    (should (string-prefix-p (expand-file-name "/custom/dir/")
+                             loaded-path))))
+
 (ert-deftest ghostel-test-compile-module-invokes-zig-build ()
-  "Source compilation runs zig build directly."
+  "Source compilation runs zig build in the resource root."
   (let ((default-directory nil)
         (messages nil)
         (warnings nil)
         (process-invocation nil))
     (let ((native-comp-enable-subr-trampolines nil))
-      (cl-letf (((symbol-function 'message)
+      (cl-letf (((symbol-function 'ghostel--resource-root)
+                 (lambda () "C:/ghostel/"))
+                ((symbol-function 'file-exists-p)
+                 (lambda (_) t))
+                ((symbol-function 'message)
                  (lambda (fmt &rest args)
                    (push (apply #'format fmt args) messages)))
                 ((symbol-function 'display-warning)
@@ -8075,28 +8851,176 @@ hand nil to the native module."
                    (setq process-invocation
                          (list program infile buffer display args default-directory))
                    0)))
-        (should (ghostel--compile-module "C:/ghostel/"))
+        (ghostel--compile-module "C:/ghostel/")
         (should (equal
                  '("zig" nil "*ghostel-build*" nil ("build" "-Doptimize=ReleaseFast" "-Dcpu=baseline") "C:/ghostel/")
                  process-invocation))
         (should-not warnings)))))
 
+(ert-deftest ghostel-test-compile-module-moves-to-dest-dir ()
+  "Compilation moves the produced module and sidecar into DEST-DIR.
+The sync `ghostel--compile-module' path goes through
+`ghostel--install-module-pair', which pre-deletes any stale dest
+sidecar so a partially-completed install never leaves a fresh
+module beside a stale sidecar (issue #256 follow-up B1)."
+  (let ((rename-args nil)
+        (made-dirs nil)
+        (deleted nil)
+        (warnings nil))
+    (let ((native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'ghostel--resource-root)
+                 (lambda () "/src/ghostel/"))
+                ((symbol-function 'file-exists-p)
+                 (lambda (_) t))
+                ((symbol-function 'make-directory)
+                 (lambda (dir &rest _) (push dir made-dirs)))
+                ((symbol-function 'delete-file)
+                 (lambda (path) (push path deleted)))
+                ((symbol-function 'rename-file)
+                 (lambda (from to &optional _ok)
+                   (push (list from to) rename-args)))
+                ((symbol-function 'message) (lambda (&rest _)))
+                ((symbol-function 'display-warning)
+                 (lambda (&rest args) (push args warnings)))
+                ((symbol-function 'process-file)
+                 (lambda (&rest _) 0)))
+        (ghostel--compile-module "/custom/dir/")
+        (should-not warnings)
+        (should (equal 1 (length deleted)))
+        (should (equal (downcase (expand-file-name
+                                  "ghostel-module.version"
+                                  "/custom/dir/"))
+                       (downcase (car deleted))))
+        (should (equal 2 (length rename-args)))
+        (let ((module-args (cadr rename-args))
+              (sidecar-args (car rename-args)))
+          (should (equal (downcase (expand-file-name
+                                    (concat "ghostel-module" module-file-suffix)
+                                    "/src/ghostel/"))
+                         (downcase (nth 0 module-args))))
+          (should (equal (downcase (expand-file-name
+                                    (concat "ghostel-module" module-file-suffix)
+                                    "/custom/dir/"))
+                         (downcase (nth 1 module-args))))
+          (should (equal (downcase (expand-file-name
+                                    "ghostel-module.version"
+                                    "/src/ghostel/"))
+                         (downcase (nth 0 sidecar-args))))
+          (should (equal (downcase (expand-file-name
+                                    "ghostel-module.version"
+                                    "/custom/dir/"))
+                         (downcase (nth 1 sidecar-args)))))
+        (should (member "/custom/dir/" made-dirs))))))
+
+(ert-deftest ghostel-test-compile-module-warns-when-build-missing ()
+  "When the build returns success but no module file appears, warn."
+  (let ((warnings nil))
+    (let ((native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'ghostel--resource-root)
+                 (lambda () "/src/ghostel/"))
+                ((symbol-function 'file-exists-p)
+                 (lambda (_) nil))
+                ((symbol-function 'message) (lambda (&rest _)))
+                ((symbol-function 'display-warning)
+                 (lambda (&rest args) (push args warnings)))
+                ((symbol-function 'process-file)
+                 (lambda (&rest _) 0)))
+        (ghostel--compile-module "/src/ghostel/")
+        (should warnings)))))
+
 (ert-deftest ghostel-test-module-compile-command-uses-zig-build ()
   "Interactive compilation uses zig build directly."
   (let ((compile-invocation nil)
-        (default-directory nil))
+        (default-directory nil)
+        (ghostel-module-directory nil))
     (let ((native-comp-enable-subr-trampolines nil))
-      (cl-letf (((symbol-function 'locate-library)
-                 (lambda (_) "C:/ghostel/ghostel.el"))
+      (cl-letf (((symbol-function 'ghostel--resource-root)
+                 (lambda () "C:/ghostel/"))
                 ((symbol-function 'compile)
                  (lambda (command &optional comint)
-                   (setq compile-invocation (list command comint default-directory)))))
+                   (setq compile-invocation (list command comint default-directory))
+                   (current-buffer))))
         (ghostel-module-compile)
         (should (equal "zig build -Doptimize=ReleaseFast -Dcpu=baseline"
                        (nth 0 compile-invocation)))
         (should (eq t (nth 1 compile-invocation)))
         (should (equal (downcase "C:/ghostel/")
                        (downcase (nth 2 compile-invocation))))))))
+
+(ert-deftest ghostel-test-module-compile-installs-when-dest-differs ()
+  "Interactive compile installs the built module into `ghostel-module-directory'.
+A `compilation-finish-functions' handler runs
+`ghostel--install-module-pair', which pre-deletes any existing dest
+sidecar and then renames the module and sidecar into place."
+  (let* ((compile-buf (generate-new-buffer " *ghostel-test-compile*"))
+         (compilation-finish-functions nil)
+         (rename-args nil)
+         (deleted nil)
+         (made-dirs nil)
+         (default-directory nil)
+         (ghostel-module-directory "/custom/dir/"))
+    (unwind-protect
+        (let ((native-comp-enable-subr-trampolines nil))
+          (cl-letf (((symbol-function 'ghostel--resource-root)
+                     (lambda () "/src/ghostel/"))
+                    ((symbol-function 'compile)
+                     (lambda (&rest _) compile-buf))
+                    ((symbol-function 'file-exists-p)
+                     (lambda (_) t))
+                    ((symbol-function 'make-directory)
+                     (lambda (dir &rest _) (push dir made-dirs)))
+                    ((symbol-function 'delete-file)
+                     (lambda (path) (push path deleted)))
+                    ((symbol-function 'rename-file)
+                     (lambda (from to &optional _ok)
+                       (push (list from to) rename-args)))
+                    ((symbol-function 'message) (lambda (&rest _))))
+            (ghostel-module-compile)
+            (should (equal 1 (length compilation-finish-functions)))
+            ;; Simulate compilation completion.
+            (funcall (car compilation-finish-functions) compile-buf "finished\n")
+            (should (null compilation-finish-functions))
+            ;; Pre-existing dest sidecar must be removed before any rename.
+            (should (equal 1 (length deleted)))
+            (should (equal (downcase (expand-file-name
+                                      "ghostel-module.version"
+                                      "/custom/dir/"))
+                           (downcase (car deleted))))
+            (should (equal 2 (length rename-args)))
+            ;; rename-args is push-order (newest first): sidecar, then module.
+            (let ((module-args (cadr rename-args))
+                  (sidecar-args (car rename-args)))
+              (should (equal (downcase (expand-file-name
+                                        (concat "ghostel-module" module-file-suffix)
+                                        "/src/ghostel/"))
+                             (downcase (nth 0 module-args))))
+              (should (equal (downcase (expand-file-name
+                                        (concat "ghostel-module" module-file-suffix)
+                                        "/custom/dir/"))
+                             (downcase (nth 1 module-args))))
+              (should (equal (downcase (expand-file-name
+                                        "ghostel-module.version"
+                                        "/src/ghostel/"))
+                             (downcase (nth 0 sidecar-args))))
+              (should (equal (downcase (expand-file-name
+                                        "ghostel-module.version"
+                                        "/custom/dir/"))
+                             (downcase (nth 1 sidecar-args)))))))
+      (when (buffer-live-p compile-buf)
+        (kill-buffer compile-buf)))))
+
+(ert-deftest ghostel-test-module-compile-no-install-when-dest-same ()
+  "When dest matches source, no finish handler is registered."
+  (let ((compilation-finish-functions nil)
+        (default-directory nil)
+        (ghostel-module-directory nil))
+    (let ((native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'ghostel--resource-root)
+                 (lambda () "/src/ghostel/"))
+                ((symbol-function 'compile)
+                 (lambda (&rest _) (current-buffer))))
+        (ghostel-module-compile)
+        (should (null compilation-finish-functions))))))
 
 (ert-deftest ghostel-test-module-version-match ()
   "Test that version check does nothing when module meets minimum."
@@ -8190,6 +9114,287 @@ missing-file code path, then restores them."
                (lambda (&rest _) (setq warned t))))
       (ghostel--check-module-version "/tmp")
       (should-not warned))))
+
+;; -----------------------------------------------------------------------
+;; Test: sidecar version file round-trip and pre-load gating
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-sidecar-read-missing ()
+  "Reading a missing sidecar returns nil."
+  (let ((tmp (make-temp-file "ghostel-test-sidecar" t)))
+    (unwind-protect
+        (should (null (ghostel--read-module-sidecar-version tmp)))
+      (delete-directory tmp t))))
+
+(ert-deftest ghostel-test-sidecar-read-empty ()
+  "Reading an empty sidecar returns nil."
+  (let ((tmp (make-temp-file "ghostel-test-sidecar" t)))
+    (unwind-protect
+        (progn
+          (with-temp-file (ghostel--module-sidecar-path tmp))
+          (should (null (ghostel--read-module-sidecar-version tmp))))
+      (delete-directory tmp t))))
+
+(ert-deftest ghostel-test-sidecar-round-trip ()
+  "Writing then reading the sidecar returns the same version string."
+  (let ((tmp (make-temp-file "ghostel-test-sidecar" t)))
+    (unwind-protect
+        (progn
+          (ghostel--write-module-sidecar-version tmp "1.2.3")
+          (should (equal "1.2.3" (ghostel--read-module-sidecar-version tmp))))
+      (delete-directory tmp t))))
+
+(ert-deftest ghostel-test-sidecar-trims-whitespace ()
+  "Trailing whitespace in the sidecar is trimmed by the reader."
+  (let ((tmp (make-temp-file "ghostel-test-sidecar" t)))
+    (unwind-protect
+        (progn
+          (with-temp-file (ghostel--module-sidecar-path tmp)
+            (insert "  0.9.1  \n\n"))
+          (should (equal "0.9.1" (ghostel--read-module-sidecar-version tmp))))
+      (delete-directory tmp t))))
+
+(ert-deftest ghostel-test-release-version-from-url ()
+  "Parsing a /releases/download/vX.Y.Z/asset URL extracts the version."
+  (should (equal
+           "0.25.0"
+           (ghostel--release-version-from-url
+            "https://github.com/owner/repo/releases/download/v0.25.0/ghostel-module-x86_64-linux.so")))
+  ;; latest-style URL (server hasn't redirected) — no version embedded.
+  (should (null
+           (ghostel--release-version-from-url
+            "https://github.com/owner/repo/releases/latest/download/ghostel-module-x86_64-linux.so")))
+  (should (null (ghostel--release-version-from-url nil))))
+
+(ert-deftest ghostel-test-load-module-skips-stale-sidecar-at-load-time ()
+  "When the sidecar reports a stale version, `module-load' must NOT run.
+At load time PROMPT-USER is nil so we only warn and skip — no
+prompt, no install, no `module-load' of the stale binary."
+  (let* ((tmp (make-temp-file "ghostel-test-load-stale" t))
+         (mod (expand-file-name (concat "ghostel-module" module-file-suffix)
+                                tmp))
+         (ghostel--minimum-module-version "0.25.0")
+         (load-calls nil)
+         (ensure-calls nil)
+         (warned nil)
+         (had-feat (featurep 'ghostel-module))
+         (saved-new (and (fboundp 'ghostel--new)
+                         (symbol-function 'ghostel--new))))
+    (unwind-protect
+        (progn
+          (when had-feat
+            (setq features (delq 'ghostel-module features)))
+          (when saved-new
+            (fmakunbound 'ghostel--new))
+          (with-temp-file mod (insert "stub"))
+          (ghostel--write-module-sidecar-version tmp "0.20.0")
+          (cl-letf (((symbol-function 'ghostel--module-directory)
+                     (lambda () (file-name-as-directory tmp)))
+                    ((symbol-function 'module-load)
+                     (lambda (path) (push path load-calls)))
+                    ((symbol-function 'ghostel--ensure-module)
+                     (lambda (dir) (push dir ensure-calls)))
+                    ((symbol-function 'display-warning)
+                     (lambda (&rest _) (setq warned t))))
+            (ghostel--load-module)
+            (should warned)
+            (should (null load-calls))
+            (should (null ensure-calls))))
+      (delete-directory tmp t)
+      (when saved-new
+        (fset 'ghostel--new saved-new))
+      (when had-feat
+        (cl-pushnew 'ghostel-module features)))))
+
+(ert-deftest ghostel-test-load-module-prompts-on-stale-sidecar ()
+  "Interactive entry with a stale sidecar runs `ghostel--ensure-module'.
+After install refreshes the sidecar, the fresh module is loaded
+in-process so no Emacs restart is needed."
+  (let* ((tmp (make-temp-file "ghostel-test-load-stale-i" t))
+         (mod (expand-file-name (concat "ghostel-module" module-file-suffix)
+                                tmp))
+         (ghostel--minimum-module-version "0.25.0")
+         (load-calls nil)
+         (ensure-calls nil)
+         (had-feat (featurep 'ghostel-module))
+         (saved-new (and (fboundp 'ghostel--new)
+                         (symbol-function 'ghostel--new))))
+    (unwind-protect
+        (progn
+          (when had-feat
+            (setq features (delq 'ghostel-module features)))
+          (when saved-new
+            (fmakunbound 'ghostel--new))
+          (with-temp-file mod (insert "stub"))
+          (ghostel--write-module-sidecar-version tmp "0.20.0")
+          (cl-letf (((symbol-function 'ghostel--module-directory)
+                     (lambda () (file-name-as-directory tmp)))
+                    ((symbol-function 'module-load)
+                     (lambda (path) (push path load-calls)))
+                    ;; Simulate a successful install: rewrite the sidecar
+                    ;; to the current minimum, leaving the .so in place.
+                    ((symbol-function 'ghostel--ensure-module)
+                     (lambda (dir)
+                       (push dir ensure-calls)
+                       (ghostel--write-module-sidecar-version
+                        dir ghostel--minimum-module-version)))
+                    ((symbol-function 'display-warning)
+                     (lambda (&rest _) nil)))
+            (ghostel--load-module t)
+            (should (equal 1 (length ensure-calls)))
+            (should (equal (list mod) load-calls))))
+      (delete-directory tmp t)
+      (when saved-new
+        (fset 'ghostel--new saved-new))
+      (when had-feat
+        (cl-pushnew 'ghostel-module features)))))
+
+(ert-deftest ghostel-test-load-module-prompts-when-loaded-but-stale ()
+  "Stale already-loaded module triggers a prompt at interactive entry.
+Issue #256: when no sidecar existed at startup the elisp loader
+still mapped the stale .so, and the previous version check ran
+with PROMPT-USER nil so only a bare warning was surfaced.  After
+the fix `M-x ghostel' must offer the install dialog."
+  (let* ((tmp (make-temp-file "ghostel-test-loaded-stale" t))
+         (ghostel--minimum-module-version "0.25.0")
+         (warned nil)
+         (ensure-calls nil)
+         (had-feat (featurep 'ghostel-module)))
+    (unwind-protect
+        (progn
+          ;; Pretend the (stale) module is already loaded.
+          (cl-pushnew 'ghostel-module features)
+          (cl-letf (((symbol-function 'ghostel--module-directory)
+                     (lambda () (file-name-as-directory tmp)))
+                    ((symbol-function 'ghostel--module-version)
+                     (lambda () "0.20.0"))
+                    ((symbol-function 'ghostel--ensure-module)
+                     (lambda (dir) (push dir ensure-calls)))
+                    ((symbol-function 'display-warning)
+                     (lambda (&rest _) (setq warned t))))
+            (ghostel--load-module t)
+            (should warned)
+            (should (equal 1 (length ensure-calls)))))
+      (delete-directory tmp t)
+      (unless had-feat
+        (setq features (delq 'ghostel-module features))))))
+
+(ert-deftest ghostel-test-load-module-no-prompt-on-loaded-stale-at-load-time ()
+  "Even with a stale loaded module, the load-time call must NOT prompt.
+The interactive prompt is gated on PROMPT-USER; load-time
+auto-execution (e.g. byte-compile) only warns."
+  (let* ((tmp (make-temp-file "ghostel-test-loaded-stale-load" t))
+         (ghostel--minimum-module-version "0.25.0")
+         (ensure-calls nil)
+         (had-feat (featurep 'ghostel-module)))
+    (unwind-protect
+        (progn
+          (cl-pushnew 'ghostel-module features)
+          (cl-letf (((symbol-function 'ghostel--module-directory)
+                     (lambda () (file-name-as-directory tmp)))
+                    ((symbol-function 'ghostel--module-version)
+                     (lambda () "0.20.0"))
+                    ((symbol-function 'ghostel--ensure-module)
+                     (lambda (dir) (push dir ensure-calls)))
+                    ((symbol-function 'display-warning)
+                     (lambda (&rest _) nil)))
+            (ghostel--load-module)
+            (should (null ensure-calls))))
+      (delete-directory tmp t)
+      (unless had-feat
+        (setq features (delq 'ghostel-module features))))))
+
+(ert-deftest ghostel-test-install-module-pair-deletes-stale-sidecar ()
+  "Existing dest sidecar is removed before the new module is moved.
+`ghostel--install-module-pair' keeps the invariant that a fresh
+module is never paired with a stale sidecar."
+  (let* ((src (make-temp-file "ghostel-test-pair-src" t))
+         (dst (make-temp-file "ghostel-test-pair-dst" t))
+         (built-mod (expand-file-name "ghostel-module.so" src))
+         (final-mod (expand-file-name "ghostel-module.so" dst))
+         (built-sidecar (expand-file-name "ghostel-module.version" src))
+         (final-sidecar (expand-file-name "ghostel-module.version" dst)))
+    (unwind-protect
+        (progn
+          (with-temp-file built-mod (insert "new-so"))
+          (with-temp-file built-sidecar (insert "0.99.0\n"))
+          (with-temp-file final-sidecar (insert "0.10.0\n"))
+          (ghostel--install-module-pair built-mod final-mod
+                                        built-sidecar final-sidecar)
+          (should (file-exists-p final-mod))
+          (should (equal "new-so" (with-temp-buffer
+                                    (insert-file-contents final-mod)
+                                    (buffer-string))))
+          (should (equal "0.99.0" (ghostel--read-module-sidecar-version dst)))
+          (should-not (file-exists-p built-mod))
+          (should-not (file-exists-p built-sidecar)))
+      (delete-directory src t)
+      (delete-directory dst t))))
+
+(ert-deftest ghostel-test-install-module-pair-sidecar-failure-leaves-absent ()
+  "A sidecar rename failure leaves the dest in `absent' state.
+The pre-delete in `ghostel--install-module-pair' guarantees that if
+the second rename fails, the destination has a fresh module but
+NO sidecar — which the loader treats as backward-compat live check,
+not as `refuse to map'."
+  (let* ((src (make-temp-file "ghostel-test-pair-fail-src" t))
+         (dst (make-temp-file "ghostel-test-pair-fail-dst" t))
+         (built-mod (expand-file-name "ghostel-module.so" src))
+         (final-mod (expand-file-name "ghostel-module.so" dst))
+         (built-sidecar (expand-file-name "ghostel-module.version" src))
+         (final-sidecar (expand-file-name "ghostel-module.version" dst))
+         (real-rename (symbol-function 'rename-file)))
+    (unwind-protect
+        (progn
+          (with-temp-file built-mod (insert "new-so"))
+          (with-temp-file built-sidecar (insert "0.99.0\n"))
+          (with-temp-file final-sidecar (insert "0.10.0\n"))
+          (cl-letf (((symbol-function 'rename-file)
+                     (lambda (from to &optional ok)
+                       (if (string-suffix-p ".version" from)
+                           (signal 'file-error '("simulated sidecar rename failure"))
+                         (funcall real-rename from to ok)))))
+            (should-error
+             (ghostel--install-module-pair built-mod final-mod
+                                           built-sidecar final-sidecar)
+             :type 'file-error))
+          ;; Fresh module landed.
+          (should (file-exists-p final-mod))
+          (should (equal "new-so" (with-temp-buffer
+                                    (insert-file-contents final-mod)
+                                    (buffer-string))))
+          ;; Stale sidecar was pre-deleted, new sidecar rename failed —
+          ;; net result is `absent', not `stale'.
+          (should-not (file-exists-p final-sidecar)))
+      (delete-directory src t)
+      (delete-directory dst t))))
+
+(ert-deftest ghostel-test-download-module-deletes-stale-sidecar-on-failure ()
+  "A failed download leaves no stale sidecar behind.
+The download path pre-deletes the dest sidecar so that even if
+`ghostel--download-file' fails, the loader falls back to the live
+version check on whatever module is on disk instead of refusing
+to map it based on stale sidecar metadata."
+  (let* ((dir (make-temp-file "ghostel-test-dl-fail" t))
+         (sidecar (ghostel--module-sidecar-path dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file sidecar (insert "0.10.0\n"))
+          (cl-letf (((symbol-function 'ghostel--download-file)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'message) (lambda (&rest _))))
+            (should-not (ghostel--download-module dir)))
+          (should-not (file-exists-p sidecar)))
+      (delete-directory dir t))))
+
+(ert-deftest ghostel-test-build-emits-sidecar-version ()
+  "`zig build' writes a sidecar matching the live module version.
+Runs in the native test suite so the build has already produced
+both the .so/.dylib and ghostel-module.version next to it."
+  (let* ((dir (ghostel--module-directory))
+         (sidecar (ghostel--read-module-sidecar-version dir)))
+    (should (stringp sidecar))
+    (should (equal sidecar (ghostel--module-version)))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: platform tag arch normalization
@@ -8605,10 +9810,11 @@ redraw and produce visible flicker, so point is left alone."
         (kill-local-variable 'pre-command-hook)))))
 
 (ert-deftest ghostel-test-mouse-1-press-no-tracking-semi-char ()
-  "Left-press in semi-char with no tracking enters copy mode and drags.
-Hands EVENT off to `mouse-drag-region' after switching to copy mode so
-Emacs's standard click-set-point and drag-to-select work, with the
-buffer frozen for selection."
+  "Left-press in semi-char with no tracking does NOT enter copy mode.
+The press only hands EVENT off to `mouse-drag-region' so that pure
+clicks merely focus the window and set point.  Copy mode is entered
+later by `ghostel-mouse-drag-or-set-region' if the press grows into
+a drag, so streaming output cannot clobber the resulting region."
   (let ((fake-event `(down-mouse-1 (,(selected-window) 1 (10 . 5) 0)))
         (copy-mode-called nil)
         (drag-region-arg nil))
@@ -8623,7 +9829,7 @@ buffer frozen for selection."
                  (lambda (event) (setq drag-region-arg event)))
                 ((symbol-function 'select-window) (lambda (_w) nil)))
         (ghostel-mouse-press-or-copy-mode fake-event))
-      (should copy-mode-called)
+      (should-not copy-mode-called)
       (should (equal fake-event drag-region-arg)))))
 
 (ert-deftest ghostel-test-mouse-1-press-no-tracking-copy-mode ()
@@ -8710,23 +9916,170 @@ mode or otherwise interfere."
   "Drag-end with no tracking hands off to `mouse-set-region'.
 This is the bug guard: without it, `mouse-drag-track's exit hook
 deactivates the mark, our intercept blocks `mouse-set-region', and
-the user-visible region disappears on release."
+the user-visible region disappears on release.  The buffer here is
+not in semi-char mode, so copy mode must not be entered."
   (let ((fake-event `(drag-mouse-1
                       (,(selected-window) 1 (5 . 2) 0)
                       (,(selected-window) 7 (10 . 4) 0)))
         (set-region-arg nil)
+        (copy-mode-called nil)
         (mouse-event-called nil))
     (with-temp-buffer
       (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'emacs)
       (cl-letf (((symbol-function 'ghostel--mode-enabled)
                  (lambda (_term _mode) nil))
                 ((symbol-function 'mouse-set-region)
                  (lambda (event) (setq set-region-arg event)))
+                ((symbol-function 'ghostel-copy-mode)
+                 (lambda () (setq copy-mode-called t)))
                 ((symbol-function 'ghostel--mouse-event)
                  (lambda (&rest _) (setq mouse-event-called t) t)))
         (ghostel-mouse-drag-or-set-region fake-event))
       (should (equal fake-event set-region-arg))
+      (should-not copy-mode-called)
       (should-not mouse-event-called))))
+
+(ert-deftest ghostel-test-mouse-1-drag-no-tracking-semi-char-enters-copy-mode ()
+  "Drag-end in semi-char with no tracking enters copy mode after region.
+The press handler no longer freezes the buffer, so freezing happens
+here once the region is established — terminal output that arrives
+after release would otherwise overwrite the highlighted cells.
+Exercises the `copy' target of `ghostel-mouse-drag-input-mode'."
+  (let ((fake-event `(drag-mouse-1
+                      (,(selected-window) 1 (5 . 2) 0)
+                      (,(selected-window) 7 (10 . 4) 0)))
+        (ghostel-mouse-drag-input-mode 'copy)
+        (set-region-arg nil)
+        (copy-mode-called nil)
+        (emacs-mode-called nil)
+        (call-order nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'semi-char)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'mouse-set-region)
+                 (lambda (event)
+                   (setq set-region-arg event)
+                   (push 'set-region call-order)))
+                ((symbol-function 'ghostel-copy-mode)
+                 (lambda ()
+                   (setq copy-mode-called t)
+                   (push 'copy-mode call-order)))
+                ((symbol-function 'ghostel-emacs-mode)
+                 (lambda () (setq emacs-mode-called t))))
+        (ghostel-mouse-drag-or-set-region fake-event))
+      (should (equal fake-event set-region-arg))
+      (should copy-mode-called)
+      (should-not emacs-mode-called)
+      ;; Region must be set before copy mode freezes the buffer.
+      (should (equal '(set-region copy-mode) (nreverse call-order))))))
+
+(ert-deftest ghostel-test-mouse-1-drag-no-tracking-semi-char-emacs-target ()
+  "Drag-end in semi-char with `ghostel-mouse-drag-input-mode' = `emacs'.
+Enters Emacs mode (not copy) so the user keeps streaming output but
+gains a read-only buffer that preserves the selection."
+  (let ((fake-event `(drag-mouse-1
+                      (,(selected-window) 1 (5 . 2) 0)
+                      (,(selected-window) 7 (10 . 4) 0)))
+        (ghostel-mouse-drag-input-mode 'emacs)
+        (set-region-arg nil)
+        (copy-mode-called nil)
+        (emacs-mode-called nil)
+        (call-order nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'semi-char)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'mouse-set-region)
+                 (lambda (event)
+                   (setq set-region-arg event)
+                   (push 'set-region call-order)))
+                ((symbol-function 'ghostel-copy-mode)
+                 (lambda () (setq copy-mode-called t)))
+                ((symbol-function 'ghostel-emacs-mode)
+                 (lambda ()
+                   (setq emacs-mode-called t)
+                   (push 'emacs-mode call-order))))
+        (ghostel-mouse-drag-or-set-region fake-event))
+      (should (equal fake-event set-region-arg))
+      (should emacs-mode-called)
+      (should-not copy-mode-called)
+      (should (equal '(set-region emacs-mode) (nreverse call-order))))))
+
+(ert-deftest ghostel-test-mouse-1-drag-no-tracking-semi-char-nil-target-stays ()
+  "Drag-end in semi-char with `ghostel-mouse-drag-input-mode' = nil.
+Stays in semi-char so the selection is best-effort and will be lost
+on the next redraw - neither copy nor Emacs mode is entered."
+  (let ((fake-event `(drag-mouse-1
+                      (,(selected-window) 1 (5 . 2) 0)
+                      (,(selected-window) 7 (10 . 4) 0)))
+        (ghostel-mouse-drag-input-mode nil)
+        (set-region-arg nil)
+        (copy-mode-called nil)
+        (emacs-mode-called nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'semi-char)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'mouse-set-region)
+                 (lambda (event) (setq set-region-arg event)))
+                ((symbol-function 'ghostel-copy-mode)
+                 (lambda () (setq copy-mode-called t)))
+                ((symbol-function 'ghostel-emacs-mode)
+                 (lambda () (setq emacs-mode-called t))))
+        (ghostel-mouse-drag-or-set-region fake-event))
+      (should (equal fake-event set-region-arg))
+      (should-not copy-mode-called)
+      (should-not emacs-mode-called))))
+
+(ert-deftest ghostel-test-mouse-1-drag-no-tracking-copy-mode-no-toggle ()
+  "Drag-end in copy mode does not call `ghostel-copy-mode' again.
+Calling `ghostel-copy-mode' from within copy mode would toggle it
+off, dropping the user back into semi-char and unfreezing the
+buffer right after they finished selecting."
+  (let ((fake-event `(drag-mouse-1
+                      (,(selected-window) 1 (5 . 2) 0)
+                      (,(selected-window) 7 (10 . 4) 0)))
+        (set-region-arg nil)
+        (copy-mode-called nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'copy)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'mouse-set-region)
+                 (lambda (event) (setq set-region-arg event)))
+                ((symbol-function 'ghostel-copy-mode)
+                 (lambda () (setq copy-mode-called t))))
+        (ghostel-mouse-drag-or-set-region fake-event))
+      (should (equal fake-event set-region-arg))
+      (should-not copy-mode-called))))
+
+(ert-deftest ghostel-test-mouse-1-drag-no-tracking-line-mode-no-copy-mode ()
+  "Drag-end in line mode does not enter copy mode.
+Line mode keeps its own buffer state and must not be flipped into
+copy mode behind the user's back."
+  (let ((fake-event `(drag-mouse-1
+                      (,(selected-window) 1 (5 . 2) 0)
+                      (,(selected-window) 7 (10 . 4) 0)))
+        (set-region-arg nil)
+        (copy-mode-called nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'line)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'mouse-set-region)
+                 (lambda (event) (setq set-region-arg event)))
+                ((symbol-function 'ghostel-copy-mode)
+                 (lambda () (setq copy-mode-called t))))
+        (ghostel-mouse-drag-or-set-region fake-event))
+      (should (equal fake-event set-region-arg))
+      (should-not copy-mode-called))))
 
 (ert-deftest ghostel-test-mouse-1-drag-tracking-forwards ()
   "Drag-end with active tracking forwards via `ghostel--mouse-drag'."
@@ -8782,6 +10135,252 @@ Never enters copy mode and never hands off to `mouse-drag-region'."
       (should (equal 1 (nth 1 mouse-event-args)))   ; button 1 = mouse-1
       (should (equal 5 (nth 2 mouse-event-args)))   ; row
       (should (equal 10 (nth 3 mouse-event-args)))))) ; col
+
+(ert-deftest ghostel-test-mouse-2-down-no-tracking-noop ()
+  "Middle-press with no tracking is a no-op.
+The matching release handler does the paste; the press must not
+forward bytes that the running program never asked for."
+  (let ((fake-event `(down-mouse-2 (,(selected-window) 1 (10 . 5) 0)))
+        (mouse-event-called nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'ghostel--mouse-event)
+                 (lambda (&rest _) (setq mouse-event-called t) t)))
+        (ghostel-mouse-down-2-or-noop fake-event))
+      (should-not mouse-event-called))))
+
+(ert-deftest ghostel-test-mouse-2-down-tracking-forwards ()
+  "Middle-press with active tracking forwards to libghostty."
+  (let ((fake-event `(down-mouse-2 (,(selected-window) 1 (10 . 5) 0)))
+        (mouse-event-args nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--process 'fake)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term mode) (eq mode 1000)))
+                ((symbol-function 'ghostel--mouse-event)
+                 (lambda (_term action button row col mods)
+                   (setq mouse-event-args (list action button row col mods))
+                   t))
+                ((symbol-function 'process-live-p) (lambda (_p) t))
+                ((symbol-function 'select-window) (lambda (_w) nil)))
+        (ghostel-mouse-down-2-or-noop fake-event))
+      (should (equal 0 (nth 0 mouse-event-args)))     ; action = press
+      (should (equal 3 (nth 1 mouse-event-args)))))) ; ghostty middle = 3
+
+(ert-deftest ghostel-test-mouse-2-release-no-tracking-pastes-primary ()
+  "Middle-release with no tracking pastes the primary selection."
+  (let ((fake-event `(mouse-2 (,(selected-window) 1 (10 . 5) 0)))
+        (paste-arg nil)
+        (mouse-event-called nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'semi-char)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'gui-get-primary-selection)
+                 (lambda () "hello primary"))
+                ((symbol-function 'ghostel--paste-text)
+                 (lambda (text) (setq paste-arg text)))
+                ((symbol-function 'ghostel--mouse-event)
+                 (lambda (&rest _) (setq mouse-event-called t) t))
+                ((symbol-function 'select-window) (lambda (_w) nil)))
+        (ghostel-mouse-paste-primary-or-release fake-event))
+      (should (equal "hello primary" paste-arg))
+      (should-not mouse-event-called))))
+
+(ert-deftest ghostel-test-mouse-2-release-empty-primary-no-paste ()
+  "Middle-release with an empty primary selection does not paste."
+  (let ((fake-event `(mouse-2 (,(selected-window) 1 (10 . 5) 0)))
+        (paste-called nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'semi-char)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'gui-get-primary-selection)
+                 (lambda () ""))
+                ((symbol-function 'ghostel--paste-text)
+                 (lambda (_t) (setq paste-called t)))
+                ((symbol-function 'select-window) (lambda (_w) nil)))
+        (ghostel-mouse-paste-primary-or-release fake-event))
+      (should-not paste-called))))
+
+(ert-deftest ghostel-test-mouse-2-release-tracking-forwards ()
+  "Middle-release with active tracking forwards to libghostty."
+  (let ((fake-event `(mouse-2 (,(selected-window) 1 (10 . 5) 0)))
+        (paste-called nil)
+        (mouse-event-args nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--process 'fake)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term mode) (eq mode 1000)))
+                ((symbol-function 'gui-get-primary-selection)
+                 (lambda () "should not be used"))
+                ((symbol-function 'ghostel--paste-text)
+                 (lambda (_t) (setq paste-called t)))
+                ((symbol-function 'ghostel--mouse-event)
+                 (lambda (_term action button row col mods)
+                   (setq mouse-event-args (list action button row col mods))
+                   t))
+                ((symbol-function 'process-live-p) (lambda (_p) t))
+                ((symbol-function 'select-window) (lambda (_w) nil)))
+        (ghostel-mouse-paste-primary-or-release fake-event))
+      (should-not paste-called)
+      (should (equal 1 (nth 0 mouse-event-args)))     ; action = release
+      (should (equal 3 (nth 1 mouse-event-args)))))) ; ghostty middle = 3
+
+(ert-deftest ghostel-test-mouse-2-paste-fast-exit-leaves-copy-mode ()
+  "Middle-click pasting in copy mode exits when fast-exit is on."
+  (let ((fake-event `(mouse-2 (,(selected-window) 1 (10 . 5) 0)))
+        (exit-called nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'copy)
+      (let ((ghostel-readonly-fast-exit t))
+        (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                   (lambda (_term _mode) nil))
+                  ((symbol-function 'gui-get-primary-selection)
+                   (lambda () "x"))
+                  ((symbol-function 'ghostel--paste-text) #'ignore)
+                  ((symbol-function 'ghostel-readonly-exit)
+                   (lambda () (setq exit-called t)))
+                  ((symbol-function 'select-window) (lambda (_w) nil)))
+          (ghostel-mouse-paste-primary-or-release fake-event)))
+      (should exit-called))))
+
+(ert-deftest ghostel-test-mouse-2-paste-no-fast-exit-stays-in-copy-mode ()
+  "Middle-click pasting in copy mode stays put when fast-exit is off."
+  (let ((fake-event `(mouse-2 (,(selected-window) 1 (10 . 5) 0)))
+        (exit-called nil)
+        (paste-called nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'copy)
+      (let ((ghostel-readonly-fast-exit nil))
+        (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                   (lambda (_term _mode) nil))
+                  ((symbol-function 'gui-get-primary-selection)
+                   (lambda () "x"))
+                  ((symbol-function 'ghostel--paste-text)
+                   (lambda (_t) (setq paste-called t)))
+                  ((symbol-function 'ghostel-readonly-exit)
+                   (lambda () (setq exit-called t)))
+                  ((symbol-function 'select-window) (lambda (_w) nil)))
+          (ghostel-mouse-paste-primary-or-release fake-event)))
+      (should-not exit-called)
+      (should paste-called))))
+
+(ert-deftest ghostel-test-mouse-2-release-selects-clicks-window ()
+  "Middle-release retargets the click's window before pasting.
+Without this, a middle-click in an unfocused ghostel window would
+read `ghostel--input-mode' / `ghostel--process' from whatever
+buffer happened to be current and paste into the wrong terminal."
+  (let* ((target-window 'fake-window)
+         (fake-event `(mouse-2 (,target-window 1 (10 . 5) 0)))
+         (selected-arg nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'semi-char)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'gui-get-primary-selection)
+                 (lambda () "x"))
+                ((symbol-function 'ghostel--paste-text) #'ignore)
+                ((symbol-function 'select-window)
+                 (lambda (w) (setq selected-arg w))))
+        (ghostel-mouse-paste-primary-or-release fake-event))
+      (should (eq target-window selected-arg)))))
+
+(ert-deftest ghostel-test-readonly-RET-on-link-opens-link ()
+  "RET on a hyperlink with fast-exit opens the link and exits read-only mode.
+The exit must happen before the link is opened so a file:// or
+fileref: link that switches buffers does not leave the ghostel
+buffer stuck in copy mode."
+  (let ((open-url nil)
+        (exit-called nil)
+        (send-called nil)
+        (call-order nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'copy)
+      (cl-letf (((symbol-function 'ghostel--uri-at-pos)
+                 (lambda (_p) "https://example.com"))
+                ((symbol-function 'ghostel--open-link)
+                 (lambda (url)
+                   (setq open-url url)
+                   (push 'open call-order)))
+                ((symbol-function 'ghostel-readonly-exit)
+                 (lambda ()
+                   (setq exit-called t)
+                   (push 'exit call-order)))
+                ((symbol-function 'ghostel--send-encoded)
+                 (lambda (&rest _) (setq send-called t))))
+        (ghostel-readonly-RET-or-exit-and-send))
+      (should (equal open-url "https://example.com"))
+      (should exit-called)
+      (should-not send-called)
+      ;; Exit before open so buffer-switching link openers
+      ;; (file://, fileref:) don't leave the ghostel buffer in copy mode.
+      (should (equal call-order '(open exit))))))
+
+(ert-deftest ghostel-test-readonly-RET-off-link-exits-and-sends ()
+  "RET off a hyperlink exits read-only mode and sends a CR."
+  (let ((open-called nil)
+        (exit-called nil)
+        (send-args nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'copy)
+      (setq-local ghostel--pre-readonly-mode 'semi-char)
+      (cl-letf (((symbol-function 'ghostel--uri-at-pos)
+                 (lambda (_p) nil))
+                ((symbol-function 'ghostel-open-link-at-point)
+                 (lambda () (setq open-called t)))
+                ((symbol-function 'ghostel-readonly-exit)
+                 (lambda () (setq exit-called t)))
+                ((symbol-function 'ghostel--send-encoded)
+                 (lambda (key mods &rest _)
+                   (setq send-args (list key mods)))))
+        (ghostel-readonly-RET-or-exit-and-send))
+      (should-not open-called)
+      (should exit-called)
+      (should (equal '("return" "") send-args)))))
+
+(ert-deftest ghostel-test-readonly-RET-no-send-when-returning-to-emacs-mode ()
+  "RET in copy mode returning to Emacs mode exits but does not send a CR.
+Emacs mode is read-only too — sending RET would do nothing useful."
+  (let ((exit-called nil)
+        (send-called nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'copy)
+      (setq-local ghostel--pre-readonly-mode 'emacs)
+      (cl-letf (((symbol-function 'ghostel--uri-at-pos)
+                 (lambda (_p) nil))
+                ((symbol-function 'ghostel-readonly-exit)
+                 (lambda () (setq exit-called t)))
+                ((symbol-function 'ghostel--send-encoded)
+                 (lambda (&rest _) (setq send-called t))))
+        (ghostel-readonly-RET-or-exit-and-send))
+      (should exit-called)
+      (should-not send-called))))
+
+(ert-deftest ghostel-test-readonly-RET-bound-only-with-fast-exit ()
+  "RET hits `ghostel-readonly-RET-or-exit-and-send' only when fast-exit is on.
+With fast-exit off the parent map's `ghostel-open-link-at-point'
+binding wins."
+  (should (eq #'ghostel-readonly-RET-or-exit-and-send
+              (lookup-key ghostel-readonly-fast-exit-mode-map (kbd "RET"))))
+  (should (eq #'ghostel-readonly-RET-or-exit-and-send
+              (lookup-key ghostel-readonly-fast-exit-mode-map (kbd "<return>"))))
+  (should (eq #'ghostel-open-link-at-point
+              (lookup-key ghostel-readonly-mode-map (kbd "RET"))))
+  (should (eq #'ghostel-open-link-at-point
+              (lookup-key ghostel-readonly-mode-map (kbd "<return>")))))
 
 (ert-deftest ghostel-test-scroll-intercept-unselected-window ()
   "Wheel events on an unselected ghostel window must not loop.
@@ -8954,6 +10553,51 @@ by the input-mode refactor)."
   ;; M-DEL must be bound so TTY Alt-Backspace ([27 127]) routes through
   ;; ghostel--send-event instead of global backward-kill-word.
   (should (eq (lookup-key ghostel-semi-char-mode-map (kbd "M-DEL")) #'ghostel--send-event)))
+
+(ert-deftest ghostel-test-yank-remap-bindings ()
+  "Alternative paste keys all route to `ghostel-yank'.
+Regression test for issue #263.  `C-y' is bound explicitly so user
+rebinds of the global `yank' key cannot break ghostel paste.
+`S-<insert>' is bound explicitly in `ghostel-semi-char-mode-map'
+because `ghostel--define-terminal-keys' otherwise routes it through
+`ghostel--send-event' as part of the `<insert>' modifier expansion.
+The `<remap> <yank>' entry catches everything else that Emacs binds
+to `yank' globally — `s-v' on macOS, plus any user rebinds.  In
+char mode all paste keys go to the terminal; line mode keeps
+Emacs's regular `yank' so paste lands in the input region."
+  ;; The remap entry itself in the maps that want ghostel-yank.
+  (should (eq (lookup-key ghostel-semi-char-mode-map [remap yank])
+              #'ghostel-yank))
+  (should (eq (lookup-key ghostel-readonly-mode-map [remap yank])
+              #'ghostel-yank))
+  ;; Line mode must NOT remap yank — regular yank into the input
+  ;; region is the right behavior there.
+  (should-not (lookup-key ghostel-line-mode-map [remap yank]))
+  ;; Char mode has no parent and no remap — every key is sent to
+  ;; the terminal.
+  (should-not (lookup-key ghostel-char-mode-map [remap yank]))
+  (should (eq (lookup-key ghostel-char-mode-map (kbd "S-<insert>"))
+              #'ghostel--send-event))
+  ;; End-to-end: with a ghostel buffer active, `key-binding' walks
+  ;; the active maps and follows the remap chain.
+  (let ((buf (generate-new-buffer " *ghostel-test-yank-remap*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          ;; Default mode is semi-char.
+          (should (eq (key-binding (kbd "C-y")) #'ghostel-yank))
+          (should (eq (key-binding (kbd "S-<insert>")) #'ghostel-yank))
+          ;; `s-v' relies on `term/ns-win.el' binding `[?\s-v]' to
+          ;; `yank' globally, which only happens when an NS window
+          ;; system loads.  On macOS batch builds without that
+          ;; binding (e.g. CI's Emacs) the remap has nothing to ride
+          ;; on, so only assert when the prerequisite is actually
+          ;; present.
+          (when (and (eq system-type 'darwin)
+                     (eq (lookup-key (current-global-map) (kbd "s-v"))
+                         'yank))
+            (should (eq (key-binding (kbd "s-v")) #'ghostel-yank))))
+      (kill-buffer buf))))
 
 (ert-deftest ghostel-test-control-meta-key-bindings ()
   "Every non-exception Control-Meta letter chord routes to `ghostel--send-event'.
@@ -9618,26 +11262,26 @@ Otherwise the window stays where the user navigated."
 ;; Test: line mode
 ;; -----------------------------------------------------------------------
 
-(ert-deftest ghostel-test-line-mode-find-prompt-end ()
-  "`ghostel--line-mode-find-prompt-end' walks back from `point-max'.
+(ert-deftest ghostel-test-input-start-point-walks-back-without-cursor ()
+  "`ghostel-input-start-point' walks back from `point-max'.
 Exercises the fallback path used when no live terminal cursor is
 available (unit tests, native module not loaded)."
   (with-temp-buffer
     ;; No prompt property anywhere → nil
     (insert "plain text")
-    (should-not (ghostel--line-mode-find-prompt-end))
+    (should-not (ghostel-input-start-point))
     ;; With prompt property
     (erase-buffer)
     (insert (propertize "$ " 'ghostel-prompt t))
     (insert "")  ; cursor right after prompt
-    (should (= (ghostel--line-mode-find-prompt-end) 3))
+    (should (= (ghostel-input-start-point) 3))
     ;; With prompt property followed by user-typed content
     (erase-buffer)
     (insert (propertize "$ " 'ghostel-prompt t))
     (insert "ls -la")
-    (should (= (ghostel--line-mode-find-prompt-end) 3))))
+    (should (= (ghostel-input-start-point) 3))))
 
-(ert-deftest ghostel-test-line-mode-find-prompt-end-uses-cursor ()
+(ert-deftest ghostel-test-input-start-point-uses-cursor-without-prop ()
   "When a terminal cursor is available, it anchors the input boundary.
 Mimics a python3-style REPL: no `ghostel-prompt' anywhere, but the
 cursor sits at the end of the `>>> ' prompt the REPL printed."
@@ -9647,16 +11291,13 @@ cursor sits at the end of the `>>> ' prompt the REPL printed."
           (insert ">>> \n")
           (setq ghostel--term 'fake)
           (setq ghostel--term-rows 1)
-          (cl-letf (((symbol-function 'ghostel--cursor-position)
-                     (lambda (_term) (cons 4 0)))
-                    ((symbol-function 'ghostel--cursor-row-char-offset)
-                     (lambda (_term) 4)))
-            ;; Cursor at col 4 of row 0 → buffer position right
-            ;; after `>>> ', i.e. position 5 (1-indexed).
-            (should (= (ghostel--line-mode-find-prompt-end) 5))))
+          (setq ghostel--cursor-char-pos 5)
+          ;; Cursor at char-pos 5 → `ghostel-input-start-point'
+          ;; returns 5, pointing right after `>>> '.
+          (should (= (ghostel-input-start-point) 5)))
       (kill-buffer buf))))
 
-(ert-deftest ghostel-test-line-mode-find-prompt-end-prefers-cursor-over-stale-prompt ()
+(ert-deftest ghostel-test-input-start-point-prefers-cursor-over-stale-prompt ()
   "A stale `ghostel-prompt' above the cursor row is ignored.
 When bash printed an OSC-133 prompt and then the user launched
 python3 (which doesn't speak OSC 133), the only `ghostel-prompt'
@@ -9673,49 +11314,15 @@ onto the bash prompt."
           (insert ">>> \n")
           (setq ghostel--term 'fake)
           (setq ghostel--term-rows 3)
-          (cl-letf (((symbol-function 'ghostel--cursor-position)
-                     (lambda (_term) (cons 4 2)))
-                    ((symbol-function 'ghostel--cursor-row-char-offset)
-                     (lambda (_term) 4)))
-            (let ((pos (ghostel--line-mode-find-prompt-end)))
-              (should pos)
-              (should (string= ">>> "
-                               (buffer-substring-no-properties
-                                (- pos 4) pos))))))
+          (setq ghostel--cursor-char-pos (1- (point-max)))
+          (let ((pos (ghostel-input-start-point)))
+            (should pos)
+            (should (string= ">>> "
+                             (buffer-substring-no-properties
+                              (- pos 4) pos)))))
       (kill-buffer buf))))
 
-(ert-deftest ghostel-test-line-mode-find-prompt-end-uses-char-offset ()
-  "Cursor → buffer-pos uses cell-walking offset, not display columns.
-Regression for the pgtk wide-char case where Emacs `char-width'
-of e.g. a box-drawing glyph reports 2 but libghostty's grid
-treats it as 1 column.  The Zig-side `cursor-row-char-offset' is
-the source of truth so the Emacs/terminal width disagreement
-cannot misplace the input boundary."
-  (let ((buf (generate-new-buffer " *ghostel-test-line-wide*")))
-    (unwind-protect
-        (with-current-buffer buf
-          ;; Pretend a wide cell is on the row.  We don't need a real
-          ;; wide char in the buffer for this test — only that the
-          ;; offset returned by Zig drives the math (not the display
-          ;; column which `move-to-column' would use).
-          (insert "AB$ ")  ; 4 chars in buffer
-          (setq ghostel--term 'fake)
-          (setq ghostel--term-rows 1)
-          (cl-letf (((symbol-function 'ghostel--cursor-position)
-                     ;; Pretend libghostty says cursor at grid col 5
-                     ;; (e.g. 2 grid cols for `A' as a wide cell, 1
-                     ;; for `B', 1 for `$', 1 for ` ').
-                     (lambda (_term) (cons 5 0)))
-                    ((symbol-function 'ghostel--cursor-row-char-offset)
-                     ;; Cell-walking gives the actual char count: 4.
-                     (lambda (_term) 4)))
-            ;; Should land at position 5 (after the 4 buffer chars),
-            ;; matching the Zig offset — NOT what `move-to-column 5'
-            ;; would yield (which depends on `char-width').
-            (should (= (ghostel--line-mode-find-prompt-end) 5))))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-line-mode-find-prompt-end-osc133-on-cursor-row ()
+(ert-deftest ghostel-test-input-start-point-osc133-on-cursor-row ()
   "When `ghostel-prompt' covers the cursor row's prefix, use its end.
 This is the canonical bash-with-shell-integration path: `$ '
 carries `ghostel-prompt', cursor sits right after it (or after
@@ -9727,13 +11334,167 @@ input already typed at the prompt)."
           (insert "ls -la")
           (setq ghostel--term 'fake)
           (setq ghostel--term-rows 1)
-          (cl-letf (((symbol-function 'ghostel--cursor-position)
-                     ;; Cursor at end of typed input.
-                     (lambda (_term) (cons 8 0)))
-                    ((symbol-function 'ghostel--cursor-row-char-offset)
-                     (lambda (_term) 8)))
+          (let ((ghostel--cursor-char-pos 8))
             ;; Prompt prefix ends at position 3 (after "$ ").
-            (should (= (ghostel--line-mode-find-prompt-end) 3))))
+            (should (= (ghostel-input-start-point) 3))))
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
+;; Test: public input-region API
+;; -----------------------------------------------------------------------
+
+(defmacro ghostel-test--with-input-fixture (prompt input &rest body)
+  "Set up a mock terminal buffer with PROMPT (carrying `ghostel-prompt')
+followed by INPUT, with `ghostel--cursor-char-pos' positioned at the
+end of INPUT.  Runs BODY in the buffer.
+
+Mocks the terminal handle and viewport so the new public input-region
+helpers can derive prompt boundaries and viewport rows without a real
+native module."
+  (declare (indent 2))
+  `(let ((buf (generate-new-buffer " *ghostel-test-input*")))
+     (unwind-protect
+         (with-current-buffer buf
+           (ghostel-mode)
+           (let ((inhibit-read-only t))
+             (insert (propertize ,prompt 'ghostel-prompt t))
+             (insert ,input))
+           (setq ghostel--term 'fake)
+           (setq ghostel--term-rows 1)
+           (setq ghostel--cursor-char-pos (point))
+           (setq ghostel--cursor-pos (cons (current-column) 0))
+           ,@body)
+       (kill-buffer buf))))
+
+(ert-deftest ghostel-test-input-start-point-returns-after-prompt-prop ()
+  "`ghostel-input-start-point' returns position right after the prompt prefix."
+  (ghostel-test--with-input-fixture "$ " "ls -la"
+    (should (= 3 (ghostel-input-start-point)))))
+
+(ert-deftest ghostel-test-input-start-point-without-prop-or-regex-uses-cursor ()
+  "When neither prop nor regex finds a prompt, returns the cursor position.
+The cursor is the final fallback so empty / non-shell lines still
+have a usable input boundary."
+  (let ((buf (generate-new-buffer " *ghostel-test-input-nocursor*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((inhibit-read-only t))
+            ;; Line has no prompt prefix and no prompt char anywhere —
+            ;; `ghostel-prompt-regexp' can't match, so the cursor wins.
+            (insert "plain text line"))
+          (setq ghostel--term 'fake)
+          (setq ghostel--term-rows 1)
+          (setq ghostel--cursor-char-pos (point))
+          (setq ghostel--cursor-pos (cons (current-column) 0))
+          (should (= (point) (ghostel-input-start-point))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-input-start-point-regex-fallback-python ()
+  "Regex fallback detects `>>> ' prompt when OSC 133 isn't available."
+  (let ((buf (generate-new-buffer " *ghostel-test-input-regex-py*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((inhibit-read-only t))
+            ;; Python REPL line — no prop, but `>>> ' matches the regex.
+            (insert ">>> hello"))
+          (setq ghostel--term 'fake)
+          (setq ghostel--term-rows 1)
+          (setq ghostel--cursor-char-pos (point))
+          (setq ghostel--cursor-pos (cons (current-column) 0))
+          ;; Regex matches `>>> ' ending at pos 5 → input starts at 5.
+          (should (= 5 (ghostel-input-start-point))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-input-start-point-regex-fallback-lambda ()
+  "Regex fallback detects `λ ' prompts."
+  (let ((buf (generate-new-buffer " *ghostel-test-input-regex-lambda*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((inhibit-read-only t))
+            (insert "λ ls"))
+          (setq ghostel--term 'fake)
+          (setq ghostel--term-rows 1)
+          (setq ghostel--cursor-char-pos (point))
+          (setq ghostel--cursor-pos (cons (current-column) 0))
+          ;; `λ ' is 2 chars (λ + space) so input-start at 3.
+          (should (= 3 (ghostel-input-start-point))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-input-start-point-prop-wins-over-regex ()
+  "When both `ghostel-prompt' prop and the regex match, prop wins.
+Constructs a fixture where the two methods disagree: the prop is
+set only on the `$' (position 1), so the walk-back returns position
+2; the regex still matches `$ ' and would return position 3.  The
+result must be 2 to prove the prop branch is consulted first."
+  (let ((buf (generate-new-buffer " *ghostel-test-input-prop-wins*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((inhibit-read-only t))
+            ;; Prop ONLY on the `$' — not the space.  The walk-back in
+            ;; `ghostel-input-start-point' stops as soon as it finds any
+            ;; `ghostel-prompt' char, so it returns the position right after
+            ;; the `$' (= 2).  The regex would match `$ ' (end = 3).
+            ;; Different answers → precedence matters.
+            (insert (propertize "$" 'ghostel-prompt t))
+            (insert " ls"))
+          (setq ghostel--term 'fake)
+          (setq ghostel--term-rows 1)
+          (setq ghostel--cursor-char-pos (point))
+          (setq ghostel--cursor-pos (cons (current-column) 0))
+          (should (= 2 (ghostel-input-start-point))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-input-start-point-regex-disabled-falls-back-to-cursor ()
+  "Setting `ghostel-prompt-regexp' to nil disables the regex fallback."
+  (let ((buf (generate-new-buffer " *ghostel-test-input-regex-off*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((inhibit-read-only t))
+            (insert ">>> hello"))
+          (setq ghostel--term 'fake)
+          (setq ghostel--term-rows 1)
+          (setq ghostel--cursor-char-pos (point))
+          (setq ghostel--cursor-pos (cons (current-column) 0))
+          ;; With regex off, the only fallback is the cursor — pos 10.
+          (let ((ghostel-prompt-regexp nil))
+            (should (= 10 (ghostel-input-start-point)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-cursor-point-tracks-cursor-char-pos ()
+  "`ghostel-cursor-point' returns `ghostel--cursor-char-pos'."
+  (ghostel-test--with-input-fixture "$ " "hello"
+    (should (= ghostel--cursor-char-pos (ghostel-cursor-point)))))
+
+(ert-deftest ghostel-test-point-on-cursor-row-p-true ()
+  "Returns t when point sits on the cursor's row."
+  (ghostel-test--with-input-fixture "$ " "hello world"
+    (should (ghostel-point-on-cursor-row-p))
+    ;; Explicit position on the same row.
+    (should (ghostel-point-on-cursor-row-p 5))))
+
+(ert-deftest ghostel-test-point-on-cursor-row-p-false-on-other-row ()
+  "Returns nil when POS is on a different buffer row."
+  (let ((buf (generate-new-buffer " *ghostel-test-multirow*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((inhibit-read-only t))
+            (insert "first line\n")
+            (insert (propertize "$ " 'ghostel-prompt t))
+            (insert "second"))
+          (setq ghostel--term 'fake)
+          (setq ghostel--term-rows 2)
+          (setq ghostel--cursor-char-pos (point))
+          (setq ghostel--cursor-pos (cons (current-column) 1))
+          ;; Point on the cursor row → t.
+          (should (ghostel-point-on-cursor-row-p))
+          ;; Point on the first row → nil.
+          (should-not (ghostel-point-on-cursor-row-p 5)))
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-line-mode-requires-anchor ()
@@ -9764,10 +11525,7 @@ but the cursor is at the end of the REPL's prompt."
           (setq ghostel--process 'fake-proc)
           (cl-letf (((symbol-function 'ghostel--mode-enabled)
                      (lambda (&rest _) nil))
-                    ((symbol-function 'ghostel--cursor-position)
-                     (lambda (_term) (cons 4 0)))
-                    ((symbol-function 'ghostel--cursor-row-char-offset)
-                     (lambda (_term) 4))
+                    (ghostel--cursor-char-pos 4)
                     ((symbol-function 'process-live-p) (lambda (_p) t))
                     ((symbol-function 'process-send-string)
                      (lambda (_p s) (setq sent s)))
@@ -9804,10 +11562,7 @@ Regression: `ghostel--line-mode-enter' previously cleared
           (setq ghostel--process 'fake-proc)
           (cl-letf (((symbol-function 'ghostel--mode-enabled)
                      (lambda (&rest _) nil))
-                    ((symbol-function 'ghostel--cursor-position)
-                     (lambda (_term) (cons 4 0)))
-                    ((symbol-function 'ghostel--cursor-row-char-offset)
-                     (lambda (_term) 4))
+                    (ghostel--cursor-char-pos 4)
                     ((symbol-function 'ghostel--invalidate)
                      (lambda (&rest _) (cl-incf invalidate-calls)))
                     ((symbol-function 'ghostel--scroll-bottom) #'ignore)
@@ -9840,10 +11595,7 @@ the hot path."
           (setq ghostel--process 'fake-proc)
           (cl-letf (((symbol-function 'ghostel--mode-enabled)
                      (lambda (&rest _) nil))
-                    ((symbol-function 'ghostel--cursor-position)
-                     (lambda (_term) (cons 4 0)))
-                    ((symbol-function 'ghostel--cursor-row-char-offset)
-                     (lambda (_term) 4))
+                    (ghostel--cursor-char-pos 4)
                     ((symbol-function 'ghostel--invalidate)
                      (lambda (&rest _) (cl-incf invalidate-calls)))
                     ((symbol-function 'ghostel--scroll-bottom) #'ignore)
@@ -10363,6 +12115,109 @@ back to the active prompt's input area."
                 (ghostel-beginning-of-input-or-line)
                 (should (= (point) expected-bol))))))
       (kill-buffer buf))))
+
+(ert-deftest ghostel-test-beginning-of-input-or-line-regex-python ()
+  "Regex fallback finds the prompt prefix on a `>>> ' line.
+With no OSC 133 prop, `C-a' should still jump past the prompt
+prefix on a Python REPL line."
+  (let ((buf (generate-new-buffer " *ghostel-test-c-a-regex-py*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          ;; No prop — the line just looks like a Python REPL line.
+          (insert ">>> import os")
+          (let ((ghostel--term 'fake)
+                (ghostel--process 'fake-proc))
+            (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore))
+              (ghostel-emacs-mode)
+              (goto-char (point-max))
+              (ghostel-beginning-of-input-or-line)
+              ;; `>>> ' is 4 chars (positions 1-4), input starts at 5.
+              (should (= (point) 5)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-beginning-of-input-or-line-regex-lambda ()
+  "Regex fallback recognizes `λ ' as a prompt prefix."
+  (let ((buf (generate-new-buffer " *ghostel-test-c-a-regex-lambda*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (insert "λ ls")
+          (let ((ghostel--term 'fake)
+                (ghostel--process 'fake-proc))
+            (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore))
+              (ghostel-emacs-mode)
+              (goto-char (point-max))
+              (ghostel-beginning-of-input-or-line)
+              ;; `λ ' is 2 chars; input starts at position 3.
+              (should (= (point) 3)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-beginning-of-input-or-line-regex-disabled ()
+  "Setting `ghostel-prompt-regexp' to nil disables the regex fallback.
+Without prop, marker, or regex, the command falls through to BOL."
+  (let ((buf (generate-new-buffer " *ghostel-test-c-a-regex-off*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (insert ">>> import os")
+          (let ((ghostel--term 'fake)
+                (ghostel--process 'fake-proc)
+                (ghostel-prompt-regexp nil))
+            (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore))
+              (ghostel-emacs-mode)
+              (goto-char (point-max))
+              (ghostel-beginning-of-input-or-line)
+              ;; No detection → BOL → point at column 0.
+              (should (= (current-column) 0)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-beginning-of-input-or-line-regex-ps2-continuation ()
+  "`C-a' on an empty PS2 continuation row lands past the prefix.
+The helper's `<=' check enables this — every fresh `RET' the user
+types produces a row like `> ' with no trailing input, and pressing
+`C-a' should put point where input would start, not at column 0."
+  (let ((buf (generate-new-buffer " *ghostel-test-c-a-ps2*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          ;; Empty continuation row — bash/zsh PS2 default is `> '.
+          ;; No `ghostel-prompt' prop, no trailing input.
+          (insert "> ")
+          (let ((ghostel--term 'fake)
+                (ghostel--process 'fake-proc))
+            (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore))
+              (ghostel-emacs-mode)
+              (goto-char (point-min))
+              (ghostel-beginning-of-input-or-line)
+              ;; `> ' is 2 chars; input would start at position 3.
+              (should (= (point) 3)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-regex-prompt-end-empty-prompt-returns-match ()
+  "Helper returns the regex match end even on an empty prompt line.
+A fresh `$ ' with no input typed yet should still report
+input-start at position 3 — pressing `C-a' on a blank prompt row
+should land past the prefix, not at column 0.  (Bug: an earlier
+draft used `<' here and rejected all-prompt lines, breaking `C-a'
+on every empty prompt the user pressed `RET' to.)"
+  (with-temp-buffer
+    (insert "$ ")
+    (should (= 3 (ghostel--regex-prompt-end 1)))))
+
+(ert-deftest ghostel-test-regex-prompt-end-matches-content ()
+  "Helper returns the match end when there's input past the prompt."
+  (with-temp-buffer
+    (insert "$ ls")
+    ;; `$ ' is 2 chars, `ls' starts at position 3.
+    (should (= 3 (ghostel--regex-prompt-end 1)))))
+
+(ert-deftest ghostel-test-regex-prompt-end-nil-regex-returns-nil ()
+  "When `ghostel-prompt-regexp' is nil the helper returns nil."
+  (with-temp-buffer
+    (insert "$ ls")
+    (let ((ghostel-prompt-regexp nil))
+      (should (null (ghostel--regex-prompt-end 1))))))
 
 (ert-deftest ghostel-test-line-mode-interrupt ()
   "Line-mode interrupt discards input, sends SIGINT, and exits."
@@ -13197,6 +15052,18 @@ slip past the unit tests."
     ghostel-test-copy-mode-cursor
     ghostel-test-ignore-cursor-change
     ghostel-test-copy-mode-hl-line
+    ghostel-test-fake-cursor-style-resolution
+    ghostel-test-fake-cursor-overlay-when-point-off-cursor
+    ghostel-test-fake-cursor-cleared-when-point-coincides
+    ghostel-test-fake-cursor-disabled-by-defcustom
+    ghostel-test-fake-cursor-disabled-by-cinsw
+    ghostel-test-fake-cursor-not-in-semi-char
+    ghostel-test-fake-cursor-box-style-uses-box-face
+    ghostel-test-fake-cursor-eol-uses-after-string
+    ghostel-test-fake-cursor-cleared-on-leave-readonly
+    ghostel-test-fake-cursor-toggles-between-eol-and-mid-line
+    ghostel-test-fake-cursor-reuses-overlay-across-positions
+    ghostel-test-fake-cursor-clears-when-term-nil
     ghostel-test-project-buffer-name
     ghostel-test-project-universal-arg
     ghostel-test-reuses-identity-match-after-rename
@@ -13208,16 +15075,39 @@ slip past the unit tests."
     ghostel-test-copy-all
     ghostel-test-copy-mode-buffer-navigation
     ghostel-test-compile-module-invokes-zig-build
+    ghostel-test-compile-module-moves-to-dest-dir
+    ghostel-test-compile-module-warns-when-build-missing
     ghostel-test-module-compile-command-uses-zig-build
+    ghostel-test-module-compile-installs-when-dest-differs
+    ghostel-test-module-compile-no-install-when-dest-same
     ghostel-test-module-download-url-uses-requested-version
     ghostel-test-module-download-url-uses-latest-release
     ghostel-test-download-module-defaults-to-minimum-version
     ghostel-test-download-module-prefix-uses-requested-version
     ghostel-test-download-module-prefix-empty-uses-latest
+    ghostel-test-download-file-is-atomic
+    ghostel-test-download-file-cleans-up-on-failure
+    ghostel-test-download-module-creates-missing-directory
+    ghostel-test-module-directory-defaults-to-resource-root
+    ghostel-test-module-directory-honours-custom-value
+    ghostel-test-download-module-targets-custom-directory
+    ghostel-test-load-module-looks-in-custom-directory
     ghostel-test-module-version-match
     ghostel-test-module-version-mismatch
     ghostel-test-module-version-newer-than-minimum
     ghostel-test-load-module-no-prompt-at-load-time
+    ghostel-test-sidecar-read-missing
+    ghostel-test-sidecar-read-empty
+    ghostel-test-sidecar-round-trip
+    ghostel-test-sidecar-trims-whitespace
+    ghostel-test-release-version-from-url
+    ghostel-test-load-module-skips-stale-sidecar-at-load-time
+    ghostel-test-load-module-prompts-on-stale-sidecar
+    ghostel-test-load-module-prompts-when-loaded-but-stale
+    ghostel-test-load-module-no-prompt-on-loaded-stale-at-load-time
+    ghostel-test-install-module-pair-deletes-stale-sidecar
+    ghostel-test-install-module-pair-sidecar-failure-leaves-absent
+    ghostel-test-download-module-deletes-stale-sidecar-on-failure
     ghostel-test-platform-tag-normalizes-arch
     ghostel-test-title-does-not-overwrite-manual-rename
     ghostel-test-title-tracking-disabled
@@ -13291,11 +15181,19 @@ slip past the unit tests."
     ghostel-test-mode-switch-keybindings
     ghostel-test-prompt-nav-enters-emacs-mode
     ghostel-test-mode-mutual-exclusivity
-    ghostel-test-line-mode-find-prompt-end
-    ghostel-test-line-mode-find-prompt-end-uses-cursor
-    ghostel-test-line-mode-find-prompt-end-prefers-cursor-over-stale-prompt
-    ghostel-test-line-mode-find-prompt-end-uses-char-offset
-    ghostel-test-line-mode-find-prompt-end-osc133-on-cursor-row
+    ghostel-test-input-start-point-walks-back-without-cursor
+    ghostel-test-input-start-point-uses-cursor-without-prop
+    ghostel-test-input-start-point-prefers-cursor-over-stale-prompt
+    ghostel-test-input-start-point-osc133-on-cursor-row
+    ghostel-test-input-start-point-returns-after-prompt-prop
+    ghostel-test-input-start-point-without-prop-or-regex-uses-cursor
+    ghostel-test-input-start-point-regex-fallback-python
+    ghostel-test-input-start-point-regex-fallback-lambda
+    ghostel-test-input-start-point-prop-wins-over-regex
+    ghostel-test-input-start-point-regex-disabled-falls-back-to-cursor
+    ghostel-test-cursor-point-tracks-cursor-char-pos
+    ghostel-test-point-on-cursor-row-p-true
+    ghostel-test-point-on-cursor-row-p-false-on-other-row
     ghostel-test-line-mode-requires-anchor
     ghostel-test-line-mode-enters-without-osc133
     ghostel-test-copy-to-line-restarts-redraw-timer
@@ -13314,6 +15212,13 @@ slip past the unit tests."
     ghostel-test-line-mode-history
     ghostel-test-beginning-of-input-or-line-on-prompt-row
     ghostel-test-beginning-of-input-or-line-in-scrollback
+    ghostel-test-beginning-of-input-or-line-regex-python
+    ghostel-test-beginning-of-input-or-line-regex-lambda
+    ghostel-test-beginning-of-input-or-line-regex-disabled
+    ghostel-test-beginning-of-input-or-line-regex-ps2-continuation
+    ghostel-test-regex-prompt-end-empty-prompt-returns-match
+    ghostel-test-regex-prompt-end-matches-content
+    ghostel-test-regex-prompt-end-nil-regex-returns-nil
     ghostel-test-line-mode-interrupt
     ghostel-test-line-mode-exit-sends-pending
     ghostel-test-line-mode-eof-on-empty
@@ -13471,7 +15376,8 @@ slip past the unit tests."
     ghostel-test-kitty-display-image-records-error
     ghostel-test-kitty-display-image-rejects-source-rect
     ghostel-test-kitty-display-image-clamps-negative-vp-col
-    ghostel-test-kitty-display-image-fully-off-screen-skipped)
+    ghostel-test-kitty-display-image-fully-off-screen-skipped
+    ghostel-test-delayed-redraw-skips-native-redraw-without-window)
   "Tests that require only Elisp (no native module).")
 
 (defun ghostel-test-run-elisp ()
@@ -13484,6 +15390,113 @@ slip past the unit tests."
   (ert-run-tests-batch-and-exit
    `(and "^ghostel-test-"
          (not (member ,@ghostel-test--elisp-tests)))))
+
+(defun ghostel-test--bold-color-palette ()
+  "Return a 256-entry hex palette string with index 1 red and 9 green.
+Used by bold-color tests so palette mapping is observable."
+  (concat "#000000"                                ;; 0
+          "#ff0000"                                ;; 1 (red)
+          (apply #'concat (make-list 7 "#000000")) ;; 2..8
+          "#00ff00"                                ;; 9 (bright red, distinguishable)
+          (apply #'concat (make-list 246 "#000000"))))
+
+(ert-deftest ghostel-test-bold-is-bright ()
+  "Test that bold text uses bright colors when ghostel-bold-color is 'bright."
+  (let ((buf (generate-new-buffer " *ghostel-test-bold*"))
+        (ghostel-bold-color 'bright))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 40 100))
+                 (inhibit-read-only t))
+            (ghostel--set-palette term (ghostel-test--bold-color-palette))
+            (ghostel--apply-bold-config term)
+
+            ;; Write bold red text
+            (ghostel--write-input term "\e[1;31mBOLD\e[0m")
+            (ghostel--redraw term)
+            (goto-char (point-min))
+            (let ((face (get-text-property (point) 'face)))
+              (should (equal "#00ff00" (plist-get face :foreground)))
+              (should (eq 'bold (plist-get face :weight))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-bold-fixed-color ()
+  "Test that bold text uses a fixed color when ghostel-bold-color is a hex string."
+  (let ((buf (generate-new-buffer " *ghostel-test-bold-fixed*"))
+        (ghostel-bold-color "#abcdef"))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 40 100))
+                 (inhibit-read-only t))
+            (ghostel--apply-bold-config term)
+
+            ;; Write bold text without color
+            (ghostel--write-input term "\e[1mBOLD\e[0m")
+            (ghostel--redraw term)
+            (goto-char (point-min))
+            (let ((face (get-text-property (point) 'face)))
+              (should (equal "#abcdef" (plist-get face :foreground)))
+              (should (eq 'bold (plist-get face :weight))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-bold-color-nil-leaves-fg-alone ()
+  "Test that bold text keeps its original color when `ghostel-bold-color' is nil."
+  (let ((buf (generate-new-buffer " *ghostel-test-bold-nil*"))
+        (ghostel-bold-color nil))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 40 100))
+                 (inhibit-read-only t))
+            (ghostel--set-palette term (ghostel-test--bold-color-palette))
+            (ghostel--apply-bold-config term)
+            ;; Bold red (palette 1) must stay red — no brightening to palette 9.
+            (ghostel--write-input term "\e[1;31mBOLD\e[0m")
+            (ghostel--redraw term)
+            (goto-char (point-min))
+            (let ((face (get-text-property (point) 'face)))
+              (should (equal "#ff0000" (plist-get face :foreground)))
+              (should (eq 'bold (plist-get face :weight))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-bold-fixed-also-brightens-palette ()
+  "Test that fixed-color bold still maps palette 0-7 to 8-15.
+The fixed color only applies to default-fg cells; palette colors take
+the bright variant just like in `bright' mode."
+  (let ((buf (generate-new-buffer " *ghostel-test-bold-fixed-palette*"))
+        (ghostel-bold-color "#abcdef"))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 40 100))
+                 (inhibit-read-only t))
+            (ghostel--set-palette term (ghostel-test--bold-color-palette))
+            (ghostel--apply-bold-config term)
+            ;; Bold red (palette 1) → bright red (palette 9 = #00ff00),
+            ;; NOT the fixed color #abcdef.
+            (ghostel--write-input term "\e[1;31mBOLD\e[0m")
+            (ghostel--redraw term)
+            (goto-char (point-min))
+            (let ((face (get-text-property (point) 'face)))
+              (should (equal "#00ff00" (plist-get face :foreground))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-bold-leaves-bright-palette-alone ()
+  "Test that bold on palette 8-15 is not re-mapped (no overflow into 16-23)."
+  (let ((buf (generate-new-buffer " *ghostel-test-bold-bright-palette*"))
+        (ghostel-bold-color 'bright))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 40 100))
+                 (inhibit-read-only t))
+            (ghostel--set-palette term (ghostel-test--bold-color-palette))
+            (ghostel--apply-bold-config term)
+            ;; SGR 91 selects palette 9 directly; bold must not shift it further.
+            (ghostel--write-input term "\e[1;91mBOLD\e[0m")
+            (ghostel--redraw term)
+            (goto-char (point-min))
+            (let ((face (get-text-property (point) 'face)))
+              (should (equal "#00ff00" (plist-get face :foreground)))
+              (should (eq 'bold (plist-get face :weight))))))
+      (kill-buffer buf))))
 
 (defun ghostel-test-run ()
   "Run all ghostel tests."
