@@ -1830,6 +1830,97 @@ the buffer is misclassified as remote, switching on TRAMP."
         (should (ghostel--local-host-p emitted))))))
 
 ;; -----------------------------------------------------------------------
+;; Test: bash OSC 7 wins the race against competing prompt-command emitters
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-bash-osc7-wins-race-vs-prompt-command ()
+  "Bash `__ghostel_osc7' must fire last so it wins the OSC 7 race.
+
+When a system/user rcfile registers a PROMPT_COMMAND that emits its
+own OSC 7 (e.g. Fedora's /etc/profile.d/vte.sh emits one via
+__vte_prompt_command using $HOSTNAME), libghostty stores whichever
+OSC 7 fires last per prompt cycle.  If ours fires first, the
+competing emitter overwrites our value and downstream classification
+\(local vs TRAMP) is wrong - which is exactly the #276 follow-up bug.
+
+The probe pre-registers a competing PROMPT_COMMAND that emits an OSC
+7 with a bogus host, then sources ghostel.bash (which captures the
+existing PROMPT_COMMAND), then manually invokes
+`__ghostel_wrapped_prompt_command'.  The last OSC 7 in the captured
+output must be ours, not the competing one."
+  (skip-unless (executable-find "bash"))
+  (let* ((root (or (ghostel--resource-root)
+                   (file-name-directory (locate-library "ghostel"))))
+         (shell-bash (expand-file-name "etc/shell/ghostel.bash" root)))
+    (skip-unless (file-exists-p shell-bash))
+    (let* ((probe
+            (concat
+             "PROMPT_COMMAND='printf \"\\e]7;file://competing-host/path\\a\"';"
+             (format " source %s;" shell-bash)
+             " __ghostel_wrapped_prompt_command"))
+           (process-environment
+            (append '("INSIDE_EMACS=ghostel") process-environment))
+           (output (with-temp-buffer
+                     (call-process "bash" nil (current-buffer) nil
+                                   "--noprofile" "--norc" "-c" probe)
+                     (buffer-string)))
+           (osc7s nil)
+           (start 0))
+      (while (string-match "\e\\]7;\\([^\a]*\\)\a" output start)
+        (push (match-string 1 output) osc7s)
+        (setq start (match-end 0)))
+      (setq osc7s (nreverse osc7s))
+      ;; Sanity: both emitters fired - otherwise the race isn't exercised.
+      (should (>= (length osc7s) 2))
+      (should (cl-some (lambda (s) (string-match-p "competing-host" s))
+                       osc7s))
+      ;; The LAST OSC 7 must be ours, not the competing one - libghostty
+      ;; stores whichever fires last per cycle.
+      (should-not (string-match-p "competing-host" (car (last osc7s)))))))
+
+;; -----------------------------------------------------------------------
+;; Test: zsh OSC 7 wins the race against competing precmd emitters
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-zsh-osc7-wins-race-vs-precmd ()
+  "Zsh `__ghostel_osc7' must run last among precmd_functions emitters.
+
+A user/system rcfile may register a precmd_function that emits OSC 7
+\(e.g. distro VTE-integration hooks).  Whichever runs last per cycle
+sets libghostty's recorded cwd.  Mirrors the bash race test."
+  (skip-unless (executable-find "zsh"))
+  (let* ((root (or (ghostel--resource-root)
+                   (file-name-directory (locate-library "ghostel"))))
+         (shell-zsh (expand-file-name "etc/shell/ghostel.zsh" root)))
+    (skip-unless (file-exists-p shell-zsh))
+    (let* ((probe
+            (concat
+             "_competing_osc7() { "
+             "printf '\\e]7;file://competing-host/path\\a' "
+             "}; "
+             "precmd_functions=(_competing_osc7); "
+             (format "source %s; " shell-zsh)
+             "for f in $precmd_functions; do $f; done"))
+           (process-environment
+            (append '("INSIDE_EMACS=ghostel") process-environment))
+           (output (with-temp-buffer
+                     (call-process "zsh" nil (current-buffer) nil
+                                   "-f" "-c" probe)
+                     (buffer-string)))
+           (osc7s nil)
+           (start 0))
+      (while (string-match "\e\\]7;\\([^\a]*\\)\a" output start)
+        (push (match-string 1 output) osc7s)
+        (setq start (match-end 0)))
+      (setq osc7s (nreverse osc7s))
+      ;; Sanity: both emitters fired - otherwise the race isn't exercised.
+      (should (>= (length osc7s) 2))
+      (should (cl-some (lambda (s) (string-match-p "competing-host" s))
+                       osc7s))
+      ;; The LAST OSC 7 must be ours.
+      (should-not (string-match-p "competing-host" (car (last osc7s)))))))
+
+;; -----------------------------------------------------------------------
 ;; Test: OSC 7 end-to-end through libghostty
 ;; -----------------------------------------------------------------------
 

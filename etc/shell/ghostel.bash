@@ -98,9 +98,14 @@ __ghostel_wrapped_prompt_command() {
     fi
 
     __ghostel_prompt_start
-    __ghostel_osc7
 
     eval "${__ghostel_original_prompt_command:-}"
+
+    # OSC 7 must fire AFTER the user/system PROMPT_COMMAND so we win the race
+    # against competing OSC 7 emitters.  Fedora's /etc/profile.d/vte.sh
+    # registers __vte_prompt_command which emits OSC 7 with $HOSTNAME
+    # (which may be polluted by container/toolbox runtimes; See #276).
+    __ghostel_osc7
 
     local __ghostel_p_initial='\[\e]133;P;k=i\a\]'
     if [[ "$PS1" != *"$__ghostel_p_initial"* ]]; then
