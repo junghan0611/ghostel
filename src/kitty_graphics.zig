@@ -1,4 +1,4 @@
-/// Kitty Graphics Protocol support via the libghostty C API.
+/// Kitty Graphics Protocol support via libghostty-vt.
 ///
 /// Queries libghostty's authoritative placement and image state during
 /// each redraw cycle, converts pixel data to PPM for Emacs display,

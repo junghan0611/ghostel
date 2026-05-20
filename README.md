@@ -1357,10 +1357,9 @@ For a detailed architectural comparison, see [design.org](design.org).
 ghostel.el          Elisp: keymap, process management, mode, commands
 src/module.zig      Entry point: emacs_module_init, function registration
 src/terminal.zig    Terminal struct wrapping ghostty handles
-src/render.zig      RenderState -> Emacs buffer with styled text
+src/Renderer.zig    RenderState -> Emacs buffer with styled text
 src/input.zig       Key and mouse encoding via ghostty encoders
 src/emacs.zig       Zig wrapper for the Emacs module C API
-src/ghostty.zig     Re-exports and constants for the ghostty C API
 ```
 
 ## License
