@@ -15,9 +15,16 @@ pub const c = @cImport({
 
 /// Emacs value type alias for convenience.
 pub const Value = c.emacs_value;
-
-const UserPtr = ?*anyopaque;
-const Finalizer = fn (?*anyopaque) callconv(.c) void;
+pub const RawEnv = ?*c.emacs_env;
+pub const FnArgs = [*c]Value;
+pub const FnData = ?*anyopaque;
+pub const UserPtr = ?*anyopaque;
+pub const Finalizer = fn (?*anyopaque) callconv(.c) void;
+pub const FuncallExit = enum(c_int) {
+    normal = 0,
+    signal = 1,
+    throw = 2,
+};
 
 const DebugUserPtr = struct {
     ptr: UserPtr,
@@ -236,8 +243,8 @@ pub const Env = struct {
 
     // --- Non-local exit handling ---
 
-    pub fn nonLocalExitCheck(self: Env) c.enum_emacs_funcall_exit {
-        return self.raw.non_local_exit_check.?(self.raw);
+    pub fn nonLocalExitCheck(self: Env) FuncallExit {
+        return @enumFromInt(self.raw.non_local_exit_check.?(self.raw));
     }
 
     pub fn nonLocalExitClear(self: Env) void {

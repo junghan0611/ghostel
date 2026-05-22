@@ -15,6 +15,10 @@ const kitty_graphics = @import("kitty_graphics.zig");
 const sys = @import("sys.zig");
 const pty = @import("pty.zig");
 
+const utils = @import("utils.zig");
+const parseHexColor = utils.parseHexColor;
+const parseHexByte = utils.parseHexByte;
+
 const c = emacs.c;
 
 /// In debug builds, all allocations go through DebugAllocator for corruption
@@ -158,39 +162,8 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
         \\
         \\(ghostel--pty-password-input-p PATH)
     );
-    env.bindFunction("ghostel--comint-make-state", 0, 0, &fnComintMakeState,
-        \\Allocate a comint stream-filter state.
-        \\
-        \\Returns an opaque handle; pass it to `ghostel--comint-filter' to
-        \\process bytes.  Freed automatically by the Emacs GC.
-        \\
-        \\(ghostel--comint-make-state)
-    );
-    env.bindFunction("ghostel--comint-filter", 2, 2, &fnComintFilter,
-        \\Feed bytes to a comint stream filter, returning propertized text.
-        \\
-        \\STATE must be a handle returned by `ghostel--comint-make-state'.
-        \\DATA is a string of raw bytes (a chunk of process output).
-        \\
-        \\Returns a string with face / mouse-face / help-echo properties
-        \\applied.  SGR state persists across calls.
-        \\
-        \\(ghostel--comint-filter STATE DATA)
-    );
-    env.bindFunction("ghostel--comint-set-palette", 2, 2, &fnComintSetPalette,
-        \\Set the 16-color ANSI palette on a comint stream filter.
-        \\
-        \\STATE must be a handle returned by `ghostel--comint-make-state'.
-        \\COLORS-STRING is the concatenated "#RRGGBB" form used by
-        \\`ghostel--set-palette'.
-        \\
-        \\(ghostel--comint-set-palette STATE COLORS-STRING)
-    );
-    env.bindFunction("ghostel--comint-set-default-colors", 3, 3, &fnComintSetDefaultColors,
-        \\Set default foreground and background on a comint stream filter.
-        \\
-        \\(ghostel--comint-set-default-colors STATE FG-HEX BG-HEX)
-    );
+
+    ComintFilter.emacs_functions.init(alloc, env);
 
     // Install system callbacks (PNG decoder for kitty graphics, logging).
     sys.init();
@@ -707,28 +680,6 @@ fn fnSetPalette(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     return env.t();
 }
 
-fn parseHexByte(hi: u8, lo: u8) ?u8 {
-    const h = hexDigit(hi) orelse return null;
-    const l = hexDigit(lo) orelse return null;
-    return (h << 4) | l;
-}
-
-fn hexDigit(ch: u8) ?u8 {
-    if (ch >= '0' and ch <= '9') return ch - '0';
-    if (ch >= 'a' and ch <= 'f') return ch - 'a' + 10;
-    if (ch >= 'A' and ch <= 'F') return ch - 'A' + 10;
-    return null;
-}
-
-/// Parse a "#RRGGBB" hex color string into a ColorRgb.
-fn parseHexColor(s: []const u8) ?gt.color.RGB {
-    if (s.len < 7 or s[0] != '#') return null;
-    const r = parseHexByte(s[1], s[2]) orelse return null;
-    const g = parseHexByte(s[3], s[4]) orelse return null;
-    const b = parseHexByte(s[5], s[6]) orelse return null;
-    return .{ .r = r, .g = g, .b = b };
-}
-
 /// (ghostel--set-default-colors TERM FG-HEX BG-HEX)
 /// Set the terminal's default foreground and background colors from "#RRGGBB" strings.
 fn fnSetDefaultColors(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
@@ -790,117 +741,6 @@ fn fnSetBoldConfig(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _:
         }
     }
 
-    return env.t();
-}
-
-// ---------------------------------------------------------------------------
-// Comint stream filter — no Terminal, just gt.Stream(Handler) for
-// `comint-preoutput-filter-functions' integration.
-// ---------------------------------------------------------------------------
-
-fn comintFinalize(ptr: ?*anyopaque) callconv(.c) void {
-    if (ptr) |p| {
-        const filter: *ComintFilter = @ptrCast(@alignCast(p));
-        filter.deinit();
-    }
-}
-
-/// (ghostel--comint-make-state)
-fn fnComintMakeState(raw_env: ?*c.emacs_env, _: isize, _: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
-    const env = emacs.Env.init(raw_env.?);
-    const filter = ComintFilter.create(alloc) catch {
-        env.signalError("failed to create comint filter state", .{});
-        return env.nil();
-    };
-    return env.makeUserPtr(comintFinalize, filter);
-}
-
-/// (ghostel--comint-filter STATE DATA)
-fn fnComintFilter(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
-    const env = emacs.Env.init(raw_env.?);
-    const filter = env.getUserPtr(ComintFilter, args[0]) orelse {
-        env.signalError("invalid comint filter state", .{});
-        return env.nil();
-    };
-
-    var stack_buf: [65536]u8 = undefined;
-    var heap_buf: ?[]const u8 = null;
-    defer if (heap_buf) |hb| alloc.free(hb);
-
-    const data = env.extractString(args[1], &stack_buf) orelse blk: {
-        heap_buf = env.extractStringAlloc(args[1], alloc);
-        break :blk heap_buf;
-    };
-    if (data == null) return env.nil();
-
-    return filter.feed(env, data.?) catch |err| {
-        env.signalError("comint filter failed: %s", .{@errorName(err)});
-        return env.nil();
-    };
-}
-
-/// (ghostel--comint-set-palette STATE COLORS-STRING)
-fn fnComintSetPalette(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
-    const env = emacs.Env.init(raw_env.?);
-    const filter = env.getUserPtr(ComintFilter, args[0]) orelse {
-        env.signalError("invalid comint filter state", .{});
-        return env.nil();
-    };
-
-    var str_buf: [2048]u8 = undefined;
-    const colors_str = env.extractString(args[1], &str_buf) orelse {
-        env.signalError("invalid palette string", .{});
-        return env.nil();
-    };
-
-    var palette16: [16]gt.color.RGB = @splat(.{});
-    var idx: usize = 0;
-    var pos: usize = 0;
-    while (idx < 16 and pos + 7 <= colors_str.len) {
-        if (colors_str[pos] != '#') {
-            pos += 1;
-            continue;
-        }
-        if (parseHexColor(colors_str[pos .. pos + 7])) |col| {
-            palette16[idx] = col;
-        }
-        idx += 1;
-        pos += 7;
-    }
-
-    filter.setPalette16(palette16);
-    return env.t();
-}
-
-/// (ghostel--comint-set-default-colors STATE FG-HEX BG-HEX)
-fn fnComintSetDefaultColors(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
-    const env = emacs.Env.init(raw_env.?);
-    const filter = env.getUserPtr(ComintFilter, args[0]) orelse {
-        env.signalError("invalid comint filter state", .{});
-        return env.nil();
-    };
-
-    var fg_buf: [16]u8 = undefined;
-    var bg_buf: [16]u8 = undefined;
-    const fg_str = env.extractString(args[1], &fg_buf) orelse {
-        env.signalError("invalid foreground color", .{});
-        return env.nil();
-    };
-    const bg_str = env.extractString(args[2], &bg_buf) orelse {
-        env.signalError("invalid background color", .{});
-        return env.nil();
-    };
-
-    const fg = parseHexColor(fg_str) orelse {
-        env.signalError("cannot parse foreground color", .{});
-        return env.nil();
-    };
-    const bg = parseHexColor(bg_str) orelse {
-        env.signalError("cannot parse background color", .{});
-        return env.nil();
-    };
-
-    filter.setDefaultColors(fg, bg);
     return env.t();
 }
 
@@ -1060,7 +900,7 @@ fn logFn(
     // void-function because ghostel-debug.el isn't loaded), clear it so it
     // doesn't leak into the calling context and disable logging to prevent
     // repeated errors.
-    if (env.nonLocalExitCheck() != c.emacs_funcall_exit_return) {
+    if (env.nonLocalExitCheck() != .normal) {
         env.nonLocalExitClear();
         vt_log_active = false;
     }
