@@ -422,15 +422,34 @@ by the input-mode refactor)."
               #'ghostel-send-C-g)))
 
 (ert-deftest ghostel-test-meta-key-bindings ()
-  "All non-exception M-<letter> keys should be bound in semi-char-mode-map."
-  (dolist (c (number-sequence ?a ?z))
-    (let* ((key-str (format "M-%c" c))
-           (key-vec (kbd key-str))
-           (binding (lookup-key ghostel-semi-char-mode-map key-vec)))
-      (unless (eq c ?y)  ; M-y is ghostel-yank-pop
-        (if (member key-str ghostel-keymap-exceptions)
-            (should-not (eq binding #'ghostel--send-event))
-          (should (eq binding #'ghostel--send-event))))))
+  "All non-exception M-<printable ASCII> keys should be bound in semi-char-mode.
+Covers digits (M-1..M-9), punctuation (M-., M-,, M-/, ...), uppercase, and
+lowercase letters.  Regression test for issue #314: only M-<a-z> was bound,
+so M-<punct>/M-<digit> fell through to Emacs commands like
+`xref-find-definitions'."
+  (dolist (c (number-sequence ?! ?~))
+    ;; ?y = ghostel-yank-pop; ?\[ and ?O are escape-sequence prefixes
+    ;; intentionally not bound (would clobber TTY input decoding).
+    (unless (memq c '(?y ?\[ ?O))
+      (let* ((key-str (format "M-%c" c))
+             (key-vec (ignore-errors (kbd key-str)))
+             (binding (and key-vec
+                           (lookup-key ghostel-semi-char-mode-map key-vec))))
+        (when key-vec
+          (if (member key-str ghostel-keymap-exceptions)
+              (should-not (eq binding #'ghostel--send-event))
+            (should (eq binding #'ghostel--send-event)))))))
+  ;; Explicit regression guards for the keys called out in issue #314.
+  (dolist (key-str '("M-." "M-," "M-/" "M-;" "M-1" "M-9" "M-!" "M-A" "M-Z"))
+    (should (eq (lookup-key ghostel-semi-char-mode-map (kbd key-str))
+                #'ghostel--send-event)))
+  ;; M-SPC: source binds this explicitly because `(kbd "M- ")' won't parse.
+  (should (eq (lookup-key ghostel-semi-char-mode-map (kbd "M-SPC"))
+              #'ghostel--send-event))
+  ;; Default exceptions (M-x, M-o, M-:) must still fall through to Emacs.
+  (dolist (key-str '("M-x" "M-:"))
+    (should-not (eq (lookup-key ghostel-semi-char-mode-map (kbd key-str))
+                    #'ghostel--send-event)))
   (should (eq (lookup-key ghostel-semi-char-mode-map (kbd "M-y")) #'ghostel-yank-pop))
   ;; M-DEL must be bound so TTY Alt-Backspace ([27 127]) routes through
   ;; ghostel--send-event instead of global backward-kill-word.

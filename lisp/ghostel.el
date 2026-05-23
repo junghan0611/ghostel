@@ -721,7 +721,7 @@ When nil, falls back to `tramp-default-method'."
                  string))
 
 (defcustom ghostel-keymap-exceptions
-  '("C-c" "C-x" "C-u" "C-h" "M-x" "M-o" "M-:" "C-\\")
+  '("C-c" "C-x" "C-u" "C-h" "M-x" "M-:" "C-\\")
   "Key sequences that should not be sent to the terminal.
 These keys pass through to Emacs instead."
   :type '(repeat string))
@@ -1781,7 +1781,7 @@ When NO-EXCEPTIONS is non-nil, also bind the keys in
   (define-key map (kbd "DEL") #'ghostel--send-event)
   ;; Emacs reports S-TAB as <backtab>
   (define-key map (kbd "<backtab>") #'ghostel--send-event)
-  ;; Control keys — bind all C-<letter> to send ASCII control codes.
+  ;; Control keys - bind all C-<letter> to send ASCII control codes.
   ;; C-i = TAB and C-m = RET are equivalent to <tab>/<return> (bound above).
   ;; C-y is reserved for ghostel-yank in semi-char mode.
   ;; C-g is always handled by `ghostel-send-C-g' so the mark and
@@ -1796,13 +1796,24 @@ When NO-EXCEPTIONS is non-nil, also bind the keys in
                       (let ((code (- c 96)))
                         (lambda () (interactive)
                           (ghostel--send-string (string code)))))))))
-  ;; Meta and Control-Meta keys - bind all (C-)M-<letter> so they reach
-  ;; the terminal instead of running Emacs commands like forward-word.
+  ;; Meta keys - bind M-<printable ASCII> so the full set reaches the terminal.
+  ;; Skip ?\[ and ?O: those are escape-sequence prefixes (CSI / SS3)
+  ;; used by Emacs input decoding for arrow/function keys in TTY mode.
+  (dolist (c (number-sequence ?! ?~))
+    (unless (memq c '(?\[ ?O))
+      (let ((key-str (format "M-%c" c)))
+        (when (or no-exceptions
+                  (not (member key-str ghostel-keymap-exceptions)))
+          (ignore-errors
+            (define-key map (kbd key-str) #'ghostel--send-event))))))
+  ;; M-SPC: `(format "M-%c" ?\s)' yields "M- ", which `kbd' rejects.
+  (let ((key-str "M-SPC"))
+    (when (or no-exceptions
+              (not (member key-str ghostel-keymap-exceptions)))
+      (define-key map (kbd key-str) #'ghostel--send-event)))
+  ;; Control-Meta keys - C-M-<letter> only; C-M-<punct>/<digit> aren't
+  ;; widely supported by terminal apps.
   (dolist (c (number-sequence ?a ?z))
-    (let ((key-str (format "M-%c" c)))
-      (when (or no-exceptions
-                (not (member key-str ghostel-keymap-exceptions)))
-        (define-key map (kbd key-str) #'ghostel--send-event)))
     (let ((key-str (format "C-M-%c" c)))
       (when (or no-exceptions
                 (not (member key-str ghostel-keymap-exceptions)))
