@@ -188,20 +188,31 @@ pub const Env = struct {
     }
 
     pub fn extractStringAlloc(self: Env, alloc: Allocator, val: Value, buf: *?[]u8) ![]u8 {
-        const ptr = if (buf.*) |b| b.ptr else null;
-        var len: isize = if (buf.*) |b| @intCast(b.len) else 0;
-        if (!self.raw.copy_string_contents.?(self.raw, val, ptr, &len) or ptr == null) {
+        // Probe the required size with a NULL buffer: Emacs sets `*len` and
+        // returns true without signaling.  Passing an undersized non-NULL
+        // buffer would instead signal `memory-buffer-too-small', and although
+        // the module API catches that signal internally, the catcher's type
+        // is `CATCHER_ALL_DEBUGGABLE' - so the user's debugger pops up when
+        // `debug-on-error' is set, even though we'd recover and retry.
+        var len: isize = 0;
+        if (!self.raw.copy_string_contents.?(self.raw, val, null, &len)) {
             self.nonLocalExitClear();
+            return error.ExtractStringFailed;
+        }
+        const required: usize = @intCast(len);
+
+        if (buf.* == null or buf.*.?.len < required) {
             if (buf.*) |b| alloc.free(b);
-            buf.* = try alloc.alloc(u8, @intCast(len));
-            if (!self.raw.copy_string_contents.?(self.raw, val, buf.*.?.ptr, &len)) {
-                self.nonLocalExitClear();
-                return error.ExtractStringFailed;
-            }
+            buf.* = try alloc.alloc(u8, required);
+        }
+
+        if (!self.raw.copy_string_contents.?(self.raw, val, buf.*.?.ptr, &len)) {
+            self.nonLocalExitClear();
+            return error.ExtractStringFailed;
         }
 
         // len includes the null terminator
-        return buf.*.?[0..(@as(usize, @intCast(len)) - 1)];
+        return buf.*.?[0 .. required - 1];
     }
 
     // --- Type checking ---
