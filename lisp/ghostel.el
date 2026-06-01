@@ -384,14 +384,24 @@ project:
                  (const :tag "Match by creation-time project identity" identity)
                  (const :tag "Both (union)" both)))
 
-(defcustom ghostel-set-title-function #'ghostel--set-title-default
-  "Function that maps a terminal title (OSC 2) to a buffer name.
-Called in the ghostel buffer with one argument, the title string, and
-should return the buffer name to use, or nil to leave the name unchanged.
-Ghostel renames the buffer to the returned name, declining
-to do so when the user has renamed the buffer manually.
-Set to nil to disable title tracking entirely."
-  :type '(choice (const :tag "Disabled" nil) function))
+;; Declared before the referent `ghostel-buffer-name-function' per the
+;; byte-compiler: the alias should precede the variable it points at.
+(define-obsolete-variable-alias 'ghostel-set-title-function
+  'ghostel-buffer-name-function "0.32.0")
+
+(defcustom ghostel-buffer-name-function #'ghostel-buffer-name-by-title
+  "Function returning the ghostel buffer name, or nil to leave it unchanged.
+Called in the ghostel buffer with one argument, the terminal TITLE (the
+OSC 2 string; may be nil or empty), on both a title change and a `cd' \(OSC 7).
+Read `default-directory' for the current directory.
+Renames the buffer to the returned string, declining after a manual rename.
+Set to nil to disable renaming entirely."
+  :type '(choice (const :tag "Disabled" nil)
+                 (function-item :tag "By title — *ghostel: TITLE*"
+                                ghostel-buffer-name-by-title)
+                 (function-item :tag "By directory — *ghostel: DIR*"
+                                ghostel-buffer-name-by-directory)
+                 (function :tag "Custom function")))
 
 (defcustom ghostel-kill-buffer-on-exit t
   "Kill the buffer when the shell process exits."
@@ -1032,6 +1042,7 @@ Used when `cursor-in-non-selected-windows' resolves to box.")
 (declare-function ghostel--module-version "ghostel-module")
 (declare-function ghostel--mouse-event "ghostel-module")
 (declare-function ghostel--new "ghostel-module")
+(declare-function ghostel--get-title "ghostel-module" (term))
 (declare-function ghostel--redraw "ghostel-module" (term &optional full))
 (declare-function ghostel--set-bold-config "ghostel-module")
 (declare-function ghostel--set-default-colors "ghostel-module")
@@ -5512,23 +5523,34 @@ No-op when FG/BG match the cached values from the previous call."
                                      :background bg))
       (setq ghostel--face-cookie-fg-bg pair))))
 
-(defun ghostel--set-title-default (title)
-  "Return the default ghostel buffer name for TITLE: \"*ghostel: TITLE*\"."
-  (format "*ghostel: %s*" title))
+(defun ghostel-buffer-name-by-title (title)
+  "Return \"*ghostel: TITLE*\", or nil when TITLE is nil or empty.
+A `ghostel-buffer-name-function' that names the buffer after the title."
+  (and title (not (string= "" title))
+       (format "*ghostel: %s*" title)))
+
+(defun ghostel-buffer-name-by-directory (_title)
+  "Return \"*ghostel: DIR*\" from `default-directory', abbreviated.
+Ignores the title; a `ghostel-buffer-name-function' that names by directory."
+  (format "*ghostel: %s*"
+          (abbreviate-file-name (directory-file-name default-directory))))
+
+(defun ghostel--rename-managed (new-name)
+  "Rename the current buffer to NEW-NAME for Ghostel name tracking.
+Declines after a manual rename; a nil or unchanged NEW-NAME is a no-op."
+  (when (and new-name
+             (or (null ghostel--managed-buffer-name)
+                 (equal (buffer-name) ghostel--managed-buffer-name))
+             (not (equal new-name (buffer-name))))
+    (rename-buffer new-name t)
+    (setq ghostel--managed-buffer-name (buffer-name))))
 
 (defun ghostel--set-title (title)
   "Rename the buffer from a terminal TITLE report (OSC 2).
-Call `ghostel-set-title-function' with TITLE to compute the new buffer name,
-unless the user has renamed the buffer manually before.
-A nil return value (or nil function) leaves the buffer name unchanged."
-  (when (and ghostel-set-title-function
-             (or (null ghostel--managed-buffer-name)
-                 (equal (buffer-name) ghostel--managed-buffer-name)))
-    (let ((new-name (funcall ghostel-set-title-function title)))
-      (when (and new-name (not (equal new-name (buffer-name))))
-        (rename-buffer new-name t)
-        ;; Keep the actual name because `rename-buffer' may uniquify it.
-        (setq ghostel--managed-buffer-name (buffer-name))))))
+Maps TITLE through `ghostel-buffer-name-function' and renames via
+`ghostel--rename-managed', which declines after a manual rename."
+  (when ghostel-buffer-name-function
+    (ghostel--rename-managed (funcall ghostel-buffer-name-function title))))
 
 (defun ghostel--set-cursor-style (style visible)
   "Set the cursor style based on terminal state.
@@ -5581,7 +5603,11 @@ file:// URL does not match the local machine, construct a TRAMP path."
                   list-buffers-directory default-directory)
           (when (file-directory-p path)
             (setq default-directory (file-name-as-directory path)
-                  list-buffers-directory default-directory)))))))
+                  list-buffers-directory default-directory))))
+      (when ghostel-buffer-name-function
+        (let ((title (and ghostel--term (ghostel--get-title ghostel--term))))
+          (ghostel--rename-managed
+           (funcall ghostel-buffer-name-function title)))))))
 
 
 ;;; Palette

@@ -635,9 +635,9 @@ resize hooks
       ;; minor-mode keymap takes precedence over the major-mode map
       ;; and the buffer-local map, so the keys work in both states.
       (ghostel-compile-toggle-mode 1)
-      ;; Disable OSC 2 title tracking so a compile command's title
-      ;; sequence can't rename the buffer mid-run.
-      (setq-local ghostel-set-title-function nil)
+      ;; Disable buffer-name tracking so a compile command's title or
+      ;; directory report can't rename the buffer mid-run.
+      (setq-local ghostel-buffer-name-function nil)
       ;; Disable password-prompt detection: `ghostel-compile--stty-flags'
       ;; runs the pty in `canonical+!echo' so the compile command isn't
       ;; double-echoed, but that's exactly the state libghostty's
