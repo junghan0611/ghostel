@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Activating the mark in semi-char mode (`C-SPC` / `set-mark-command`,
+  expand-region variants, `C-x h`, or any other region-activating command)
+  now switches to a read-only mode, mirroring mouse selection, so streaming
+  output cannot clobber a keyboard-driven region.  Implemented via a
+  buffer-local `activate-mark-hook`, so it works for whatever command the
+  user has bound — no specific keys are intercepted.  The target mode is
+  picked by the new `ghostel-mark-activation-input-mode` defcustom (`copy`
+  default, `emacs`, or nil to keep the old stay-in-semi-char behavior).
+  Mouse selection still follows `ghostel-mouse-drag-input-mode`
+  independently.
+
+### Fixed
+- Char mode now captures GUI `C-SPC` and forwards it to the terminal as NUL;
+  previously only the TTY `C-@` representation was bound, so a GUI
+  Ctrl+Space in char mode fell through to the global `set-mark-command`.
+
 ## [0.34.0] — 2026-06-08
 
 ### Added

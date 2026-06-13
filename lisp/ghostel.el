@@ -782,6 +782,20 @@ is not in semi-char-mode when the gesture completes."
                  (const :tag "Emacs mode"          emacs)
                  (const :tag "Do not switch"       nil)))
 
+(defcustom ghostel-mark-activation-input-mode 'copy
+  "Input mode to switch to when the mark becomes active in semi-char mode.
+Triggered by any command that activates the region, e.g. `set-mark-command',
+expand-region variants, `mark-whole-buffer', `exchange-point-and-mark'.
+
+Mouse selection is governed separately by `ghostel-mouse-drag-input-mode'."
+  :type '(choice (const :tag "Copy mode (default)" copy)
+                 (const :tag "Emacs mode"          emacs)
+                 (const :tag "Do not switch"       nil)))
+
+(defvar ghostel--inhibit-mark-activation nil
+  "When non-nil, `ghostel--mark-activated' is a no-op.
+Bound by the mouse handlers, which pick the input mode themselves.")
+
 (defcustom ghostel-word-boundary-string " \t\"'`|:;,()[]{}<>$│"
   "Characters that terminate words in ghostel buffers.
 
@@ -1554,7 +1568,7 @@ Matches Ghostty 1.2.0's `bold-color' configuration."
   "The position of the terminal cursor in the buffer.")
 
 (defvar-local ghostel--rendered-font nil
-  "The font last used for rendering. Internally used by native code.")
+  "The font last used for rendering.  Internally used by native code.")
 
 (defvar ghostel--query-font-cache nil
   "Dynamically bound cache for `query-font' during one native redraw.")
@@ -1789,12 +1803,16 @@ When NO-EXCEPTIONS is non-nil, also bind the keys in
   ;; the `[M-backspace]' symbol path; without this binding, TTY
   ;; Alt-Backspace falls through to global `backward-kill-word'.
   (define-key map (kbd "M-DEL") #'ghostel--send-event)
-  ;; C-@ (NUL, same as C-SPC) — used by programs like Emacs-in-terminal
+  ;; Ctrl+Space is NUL. A TTY delivers it as `C-@'.  GUI Emacs as the distinct
+  ;; event `C-SPC', which only char mode captures.  In semi-char `C-SPC' falls
+  ;; through to the global map so mark commands run there.
   (define-key map (kbd "C-@")
               (lambda () (interactive) (ghostel--send-string "\x00")))
   ;; Char mode extras: also bind non-letter exception keys so nothing
   ;; gets stolen by Emacs while a TUI app runs.
   (when no-exceptions
+    (define-key map (kbd "C-SPC")
+                (lambda () (interactive) (ghostel--send-string "\x00")))
     (define-key map (kbd "C-\\")
                 (lambda () (interactive) (ghostel--send-string "\x1c")))
     (define-key map (kbd "M-:") #'ghostel--send-event)))
@@ -2641,7 +2659,10 @@ selected before focusing it, for `ghostel-mouse-release-or-set-point'."
     (select-window win)
     (if (ghostel--mouse-tracking-active-p)
         (ghostel--mouse-press event)
-      (mouse-drag-region event))))
+      ;; `mouse-drag-region' activates the mark mid-drag; the release
+      ;; handler picks the input mode, so keep the hook out of it.
+      (let ((ghostel--inhibit-mark-activation t))
+        (mouse-drag-region event)))))
 
 (defun ghostel-mouse-release-or-set-point (event &optional promote-to-region)
   "Forward EVENT to the terminal, or set point / switch input mode.
@@ -2667,7 +2688,8 @@ stays in semi-char (skipped when `ghostel-mouse-drag-input-mode' is nil)."
      ;; Multi-click, or a single click in an already-selected window: set
      ;; point/selection, then freeze (a focus click never reaches here).
      (t
-      (mouse-set-point event promote-to-region)
+      (let ((ghostel--inhibit-mark-activation t))
+        (mouse-set-point event promote-to-region))
       (when active
         (pcase ghostel-mouse-drag-input-mode
           ('copy  (ghostel-copy-mode))
@@ -2685,7 +2707,8 @@ region is set to mode configured in `ghostel-mouse-drag-input-mode'."
   (interactive "e")
   (if (ghostel--mouse-tracking-active-p)
       (ghostel--mouse-drag event)
-    (mouse-set-region event)
+    (let ((ghostel--inhibit-mark-activation t))
+      (mouse-set-region event))
     (when (eq ghostel--input-mode 'semi-char)
       (pcase ghostel-mouse-drag-input-mode
         ('copy  (ghostel-copy-mode))
@@ -3061,6 +3084,17 @@ returns to whichever input mode was active before."
       (ghostel-readonly-exit)
     (ghostel--enter-readonly 'copy t ":Copy"
                              "Copy mode: Press any key to exit")))
+
+(defun ghostel--mark-activated ()
+  "Switch input mode when the region becomes active in semi-char mode.
+On buffer-local `activate-mark-hook'; the keyboard analog of
+`ghostel-mouse-drag-or-set-region'.  Runs after the activating
+command set the region, so the selection survives the switch."
+  (when (and (not ghostel--inhibit-mark-activation)
+             (eq ghostel--input-mode 'semi-char))
+    (pcase ghostel-mark-activation-input-mode
+      ('copy  (ghostel-copy-mode))
+      ('emacs (ghostel-emacs-mode)))))
 
 (defun ghostel-readonly-exit ()
   "Exit copy or Emacs mode and return to the mode active before entry."
@@ -6370,6 +6404,7 @@ a Ghostel window making it lose its anchoring."
   (add-hook 'window-buffer-change-functions #'ghostel--window-buffer-change nil t)
   (add-hook 'window-buffer-change-functions #'ghostel--sync-tty-composition nil t)
   (add-hook 'window-size-change-functions #'ghostel--anchor-on-resize nil t)
+  (add-hook 'activate-mark-hook #'ghostel--mark-activated nil t)
   (add-hook 'minibuffer-exit-hook #'ghostel--minibuffer-exit)
   (ghostel--suppress-interfering-modes)
   (ghostel-imenu-setup)
