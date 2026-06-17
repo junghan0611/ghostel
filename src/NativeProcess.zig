@@ -27,7 +27,8 @@ term_mutex: std.Thread.Mutex = .{},
 term: *gt.Terminal,
 stream: gt.Stream(GhostelHandler(*Self)),
 
-quit_pipe: [2]posix.fd_t = .{ -1, -1 },
+wake_pipe: [2]posix.fd_t = .{ -1, -1 },
+quit: bool = false,
 thread: std.Thread,
 
 pub fn init(
@@ -48,7 +49,7 @@ pub fn init(
         .event_pipe = event_pipe,
         .term = term,
         .stream = .initAlloc(alloc, .init(self, term)),
-        .quit_pipe = pipe,
+        .wake_pipe = pipe,
         .thread = try std.Thread.spawn(.{}, Self.run, .{self}),
     };
 }
@@ -130,35 +131,6 @@ fn run(self: *Self) void {
     posix.close(self.event_pipe);
 }
 
-fn blockSigpipe(self: *Self) void {
-    // On macOS and platforms that have it, set F_SETNOSIGPIPE
-    if (@hasDecl(posix.F, "SETNOSIGPIPE")) {
-        _ = posix.fcntl(self.event_pipe, posix.F.SETNOSIGPIPE, 1) catch |err| {
-            log.warn("Unable to set SETNOSIGPIPE: {any}", .{err});
-        };
-    }
-    // Linux doesn't have F_SETNOSIGPIPE so mask the SIGPIPE
-    // and drain it at the end.
-    var set: c.sigset_t = undefined;
-    _ = c.sigemptyset(&set);
-    _ = c.sigaddset(&set, posix.SIG.PIPE);
-    _ = posix.errno(c.pthread_sigmask(c.SIG_BLOCK, &set, null));
-}
-
-fn drainSigpipe() void {
-    // On Linux, clear any SIGPIPE that is pending. This doesn't work on macOS
-    // but on macOS we have F_SETNOSIGPIPE instead and the code below is noop.
-    var pending: c.sigset_t = undefined;
-    _ = c.sigpending(&pending);
-    if (c.sigismember(&pending, posix.SIG.PIPE) != 0) {
-        var wait_sigs: c.sigset_t = undefined;
-        _ = c.sigemptyset(&wait_sigs);
-        _ = c.sigaddset(&wait_sigs, posix.SIG.PIPE);
-        var sig: c_int = undefined;
-        _ = c.sigwait(&wait_sigs, &sig);
-    }
-}
-
 fn loop(self: *Self) !void {
     const fd = self.process.pty.primary_fd;
     const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
@@ -179,7 +151,7 @@ fn loopOnce(self: *Self) !bool {
             .revents = undefined,
         },
         .{
-            .fd = self.quit_pipe[0],
+            .fd = self.wake_pipe[0],
             .events = posix.POLL.IN,
             .revents = undefined,
         },
@@ -189,9 +161,11 @@ fn loopOnce(self: *Self) !bool {
     _ = try posix.poll(&pollfds, -1);
 
     while (true) {
+        if (@atomicLoad(bool, &self.quit, .monotonic)) return false;
+
         const len = posix.read(self.process.pty.primary_fd, &buf) catch |err| switch (err) {
             error.WouldBlock => break,
-            error.NotOpenForReading, error.InputOutput => return false,
+            error.NotOpenForReading, error.InputOutput => break,
             else => return err,
         };
 
@@ -200,14 +174,11 @@ fn loopOnce(self: *Self) !bool {
         {
             self.term_mutex.lock();
             defer self.term_mutex.unlock();
-
             self.stream.nextSlice(buf[0..len]);
         }
     }
 
-    if (pollfds[0].revents & posix.POLL.HUP != 0 or
-        pollfds[1].revents & posix.POLL.IN != 0)
-    {
+    if (pollfds[0].revents & posix.POLL.HUP != 0) {
         return false;
     }
 
@@ -246,10 +217,41 @@ fn flushEvents(self: *Self) !void {
     self.event_buf.resize(0);
 }
 
+fn blockSigpipe(self: *Self) void {
+    // On macOS and platforms that have it, set F_SETNOSIGPIPE
+    if (@hasDecl(posix.F, "SETNOSIGPIPE")) {
+        _ = posix.fcntl(self.event_pipe, posix.F.SETNOSIGPIPE, 1) catch |err| {
+            log.warn("Unable to set SETNOSIGPIPE: {any}", .{err});
+        };
+    }
+    // Linux doesn't have F_SETNOSIGPIPE so mask the SIGPIPE
+    // and drain it at the end.
+    var set: c.sigset_t = undefined;
+    _ = c.sigemptyset(&set);
+    _ = c.sigaddset(&set, posix.SIG.PIPE);
+    _ = posix.errno(c.pthread_sigmask(c.SIG_BLOCK, &set, null));
+}
+
+fn drainSigpipe() void {
+    // On Linux, clear any SIGPIPE that is pending. This doesn't work on macOS
+    // but on macOS we have F_SETNOSIGPIPE instead and the code below is noop.
+    var pending: c.sigset_t = undefined;
+    _ = c.sigpending(&pending);
+    if (c.sigismember(&pending, posix.SIG.PIPE) != 0) {
+        var wait_sigs: c.sigset_t = undefined;
+        _ = c.sigemptyset(&wait_sigs);
+        _ = c.sigaddset(&wait_sigs, posix.SIG.PIPE);
+        var sig: c_int = undefined;
+        _ = c.sigwait(&wait_sigs, &sig);
+    }
+}
+
 pub fn deinit(self: *Self) void {
-    _ = posix.write(self.quit_pipe[1], "X") catch {};
+    @atomicStore(bool, &self.quit, true, .monotonic);
+    _ = posix.write(self.wake_pipe[1], "X") catch {};
     self.thread.join();
+    posix.close(self.wake_pipe[0]);
+    posix.close(self.wake_pipe[1]);
+
     self.stream.deinit();
-    posix.close(self.quit_pipe[1]);
-    posix.close(self.quit_pipe[0]);
 }
