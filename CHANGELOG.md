@@ -4,7 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.35.0] — 2026-06-18
+
 ### Added
+- Local Ghostel buffers now use the native PTY backend by default via
+  `ghostel-use-native-pty`.  The native reader consumes PTY output outside
+  Emacs's process filter path while remote TRAMP buffers continue to use Emacs
+  processes.
+- Hyperlinks now support Eldoc, showing link metadata at point.
 - Activating the mark in semi-char mode (`C-SPC` / `set-mark-command`,
   expand-region variants, `C-x h`, or any other region-activating command)
   now switches to a read-only mode, mirroring mouse selection, so streaming
@@ -15,6 +22,13 @@ All notable changes to this project will be documented in this file.
   default, `emacs`, or nil to keep the old stay-in-semi-char behavior).
   Mouse selection still follows `ghostel-mouse-drag-input-mode`
   independently.
+
+### Changed
+- `evil-ghostel` now uses Evil operators, motions, and command remaps instead
+  of broad advice around core Evil commands.  Normal/visual editing keeps its
+  PTY-driven behavior while avoiding the previous advice lifecycle hazards, and
+  Evil buffers opt out of Ghostel's keyboard-mark-to-copy-mode switch so visual
+  state owns selection.
 
 ### Fixed
 - ZSH shell integration now reports gethostname(2) in its OSC 7 directory update
@@ -28,6 +42,15 @@ All notable changes to this project will be documented in this file.
 - Char mode now captures GUI `C-SPC` and forwards it to the terminal as NUL;
   previously only the TTY `C-@` representation was bound, so a GUI
   Ctrl+Space in char mode fell through to the global `set-mark-command`.
+- CJK and other fallback glyphs now claim cell space correctly, and fallback
+  glyph scaling is clamped independently for ascent and descent.  This prevents
+  rows from growing or shrinking when tall glyphs (for example status-line
+  symbols) blink in and out.
+- `evil-ghostel` now forwards `<delete>` correctly inside alt-screen TUIs;
+  previously it could edit the rendered buffer locally and then reappear on the
+  next redraw.
+- Read-only/copy-mode exits and minibuffer-close reanchoring no longer try to
+  anchor stale windows or non-live/frozen Ghostel terminals.
 - A left-click that only focuses a Ghostel window — bringing the frame to the
   foreground from another application or Emacs frame, or selecting an unfocused
   window in the current frame — is now treated as a pure focus click and never
@@ -47,6 +70,10 @@ All notable changes to this project will be documented in this file.
     mouse handlers (gating on `this-command'), so that deferred activation no
     longer freezes the buffer.  Mouse selection stays governed by
     `ghostel-mouse-drag-input-mode' alone.
+
+### Internal
+- Benchmark and dape helper tooling were updated, and PTY lifecycle coverage now
+  exercises both Emacs and native backends.
 
 ## [0.34.0] — 2026-06-08
 
