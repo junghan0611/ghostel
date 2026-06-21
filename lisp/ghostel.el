@@ -746,6 +746,15 @@ Customize the faces `ghostel-fake-cursor' and
 `ghostel-fake-cursor-box' to tune the appearance."
   :type 'boolean)
 
+(defcustom ghostel-initial-input-mode 'semi-char
+  "Input mode a freshly started `ghostel' terminal begins in.
+One of `semi-char' (default), `char', or `line'.  `line' engages on
+the first redraw that exposes a prompt, because it needs a prompt to
+anchor the input region.  Has no effect on `ghostel-exec'."
+  :type '(choice (const :tag "Semi-char (default)" semi-char)
+                 (const :tag "Char mode" char)
+                 (const :tag "Line mode" line)))
+
 (defcustom ghostel-mouse-drag-input-mode 'copy
   "Input mode to switch to after a left-button mouse click or selection.
 
@@ -5866,6 +5875,14 @@ buffer creation time — see `ghostel--buffer-identity'."
                           identity)))
             (buffer-list)))
 
+(defun ghostel--apply-initial-input-mode ()
+  "Switch a new `ghostel' terminal to `ghostel-initial-input-mode'.
+`char' applies now; `line' is deferred to the first prompt;
+`semi-char' needs nothing."
+  (pcase ghostel-initial-input-mode
+    ('char (ghostel-char-mode))
+    ('line (setq ghostel--pending-initial-line-mode t))))
+
 ;;;###autoload
 (defun ghostel (&optional arg)
   "Start a new Ghostel terminal.  If the buffer already exists, switch to it.
@@ -5897,7 +5914,8 @@ Returns the buffer."
       (with-current-buffer buffer
         (setq ghostel--managed-buffer-name (buffer-name))
         (setq ghostel--buffer-identity (or identity (buffer-name)))
-        (ghostel--start-process)))
+        (ghostel--start-process)
+        (ghostel--apply-initial-input-mode)))
     buffer))
 
 (defun ghostel-exec (buffer program &optional args)

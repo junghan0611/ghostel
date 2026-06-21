@@ -26,6 +26,7 @@
 (declare-function ghostel--mode-line-tag-make "ghostel")
 (declare-function ghostel--open-link "ghostel")
 (declare-function ghostel--redraw "ghostel-module" (term &optional full))
+(declare-function ghostel--regex-prompt-end "ghostel")
 (declare-function ghostel--send-encoded "ghostel")
 (declare-function ghostel--uri-at-pos "ghostel")
 (declare-function ghostel--write-pty "ghostel-module")
@@ -161,6 +162,12 @@ duplicating the prefix when the shell echoes our line back.")
 Set by `ghostel--line-mode-enter'; tells `ghostel--line-mode-pre-redraw'
 not to auto-pause line mode merely because the alt screen is up.
 Cleared by `ghostel--line-mode-teardown'.")
+
+(defvar-local ghostel--pending-initial-line-mode nil
+  "Non-nil to enter line mode at the first prompt of a fresh terminal.
+Armed by `ghostel--apply-initial-input-mode' when
+`ghostel-initial-input-mode' is `line'; consumed by
+`ghostel--line-mode-maybe-enter-initial' once a prompt renders.")
 
 
 ;;; Keymap and commands
@@ -668,10 +675,41 @@ paints) so `ghostel-input-start-point' sees the
 post-TUI buffer state.  Re-attempts every redraw cycle until a
 prompt is locatable — covers the case where the shell prints its
 new prompt one or more redraws after libghostty leaves the alt
-screen."
+screen.  Also drives the deferred startup entry when
+`ghostel-initial-input-mode' is `line'."
   (when (and ghostel--line-mode-paused
              (not (ghostel--line-mode-alt-screen-p)))
-    (ghostel--line-mode-try-resume)))
+    (ghostel--line-mode-try-resume))
+  (ghostel--line-mode-maybe-enter-initial))
+
+(defun ghostel--line-mode-startup-prompt-ready-p ()
+  "Non-nil when the cursor row shows a real prompt (OSC 133 prop or regex).
+Gates the deferred startup entry so line mode skips a blank pre-prompt screen.
+Unlike `ghostel-input-start-point', the bare cursor does not count as a prompt."
+  (when-let* ((cursor-pos ghostel--cursor-char-pos))
+    (save-excursion
+      (goto-char cursor-pos)
+      (let ((row-start (line-beginning-position))
+            (pos cursor-pos))
+        (while (and (> pos row-start)
+                    (not (get-text-property (1- pos) 'ghostel-prompt)))
+          (setq pos (1- pos)))
+        (or (and (> pos row-start)
+                 (get-text-property (1- pos) 'ghostel-prompt))
+            (ghostel--regex-prompt-end cursor-pos))))))
+
+(defun ghostel--line-mode-maybe-enter-initial ()
+  "Enter line mode once the first prompt renders, if armed at startup.
+Armed by `ghostel-initial-input-mode' = `line'.  Runs each redraw cycle until a
+prompt appears, then enters and disarms.  A manual mode switch during startup
+wins: a non-semi-char buffer drops the flag without entering."
+  (when ghostel--pending-initial-line-mode
+    (cond
+     ((not (eq ghostel--input-mode 'semi-char))
+      (setq ghostel--pending-initial-line-mode nil))
+     ((ghostel--line-mode-startup-prompt-ready-p)
+      (setq ghostel--pending-initial-line-mode nil)
+      (ghostel-line-mode)))))
 
 (defun ghostel-line-mode-send ()
   "Send the current in-progress input line to the shell.

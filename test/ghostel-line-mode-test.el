@@ -1975,5 +1975,76 @@ the flag must not keep suppressing the pause forever."
               (should ghostel--line-mode-paused))))
       (kill-buffer buf))))
 
+;;; Initial input mode (ghostel-initial-input-mode)
+
+(ert-deftest ghostel-test-initial-input-mode-line-arms-deferred-entry ()
+  "`ghostel--apply-initial-input-mode' arms deferred entry for `line'.
+The buffer stays in semi-char until a prompt renders."
+  :tags '(native)
+  (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
+    (with-current-buffer buf
+      (let ((ghostel-initial-input-mode 'line))
+        (ghostel--apply-initial-input-mode))
+      (should ghostel--pending-initial-line-mode)
+      (should (eq ghostel--input-mode 'semi-char)))))
+
+(ert-deftest ghostel-test-initial-input-mode-char-applies-immediately ()
+  "`ghostel-initial-input-mode' = `char' enters char mode at startup."
+  :tags '(native)
+  (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
+    (set-window-buffer (selected-window) buf)
+    (with-current-buffer buf
+      (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore))
+        (let ((ghostel-initial-input-mode 'char))
+          (ghostel--apply-initial-input-mode)))
+      (should (eq ghostel--input-mode 'char))
+      (should-not ghostel--pending-initial-line-mode))))
+
+(ert-deftest ghostel-test-initial-line-mode-defers-until-prompt ()
+  "`ghostel-initial-input-mode' = `line' waits for the first prompt, then enters.
+The deferred entry stays armed across redraws with no detectable
+prompt and engages on the redraw that exposes one."
+  :tags '(native)
+  (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
+    (setq ghostel-detect-password-prompts nil)
+    (set-window-buffer (selected-window) buf)
+    (setq ghostel--process 'fake-proc)
+    ;; Arm exactly as `ghostel--apply-initial-input-mode' would.
+    (setq ghostel--pending-initial-line-mode t)
+    (cl-letf (((symbol-function 'process-live-p) (lambda (_p) t))
+              ((symbol-function 'ghostel--write-pty) #'ignore)
+              ((symbol-function 'ghostel--invalidate) #'ignore))
+      ;; Output with no prompt yet — must not enter line mode.
+      (ghostel--write-vt term "starting up...\r\n")
+      (ghostel--redraw-now buf)
+      (should ghostel--pending-initial-line-mode)
+      (should (eq ghostel--input-mode 'semi-char))
+      ;; First prompt arrives — the next redraw enters line mode.
+      (ghostel--write-vt term "\e]133;A\e\\$ \e]133;B\e\\")
+      (ghostel--redraw-now buf)
+      (should (eq ghostel--input-mode 'line))
+      (should-not ghostel--pending-initial-line-mode)
+      (should (markerp ghostel--line-input-start)))))
+
+(ert-deftest ghostel-test-initial-line-mode-respects-manual-override ()
+  "A manual mode switch before the first prompt cancels deferred line entry."
+  :tags '(native)
+  (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
+    (setq ghostel-detect-password-prompts nil)
+    (set-window-buffer (selected-window) buf)
+    (setq ghostel--process 'fake-proc)
+    (setq ghostel--pending-initial-line-mode t)
+    (cl-letf (((symbol-function 'process-live-p) (lambda (_p) t))
+              ((symbol-function 'ghostel--write-pty) #'ignore)
+              ((symbol-function 'ghostel--invalidate) #'ignore))
+      ;; User switches to char mode before any prompt.
+      (ghostel-char-mode)
+      (should (eq ghostel--input-mode 'char))
+      ;; Prompt arrives; deferred entry must not override the user's choice.
+      (ghostel--write-vt term "\e]133;A\e\\$ \e]133;B\e\\")
+      (ghostel--redraw-now buf)
+      (should (eq ghostel--input-mode 'char))
+      (should-not ghostel--pending-initial-line-mode))))
+
 (provide 'ghostel-line-mode-test)
 ;;; ghostel-line-mode-test.el ends here
