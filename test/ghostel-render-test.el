@@ -1519,6 +1519,71 @@ for new size inside BSU/ESU → verify buffer shows new content."
               (should-not (string-match-p "OLD-LINE" content)))))
       (kill-buffer buf))))
 
+(defmacro ghostel-test--with-open-sync-output (spec &rest body)
+  "Run BODY in a displayed terminal buffer left mid synchronized output.
+SPEC is (BUFFER TERM).  Sets up a ghostel buffer showing BASELINE-CONTENT,
+then opens mode 2026 and mutates the grid to UPDATED-CONTENT *without*
+closing it - the state of a buffer hidden while a TUI streams a frame."
+  (declare (indent 1))
+  (pcase-let ((`(,buffer ,term) spec))
+    `(let ((,buffer (generate-new-buffer " *ghostel-test-open-sync-output*")))
+       (unwind-protect
+           (with-current-buffer ,buffer
+             (set-window-buffer (selected-window) (current-buffer))
+             (ghostel-mode)
+             (let* ((,term (ghostel--new 10 40 100))
+                    (ghostel--term ,term)
+                    (ghostel--term-rows 10)
+                    (ghostel--term-cols 40)
+                    (ghostel--force-next-redraw nil)
+                    (inhibit-read-only t))
+               ;; Baseline content, rendered into the buffer.
+               (ghostel--write-vt ,term "\e[H\e[2JBASELINE-CONTENT")
+               (ghostel--redraw ,term t)
+               (should (string-match-p "BASELINE-CONTENT" (buffer-string)))
+               ;; Open synchronized output and mutate the grid without closing
+               ;; it, as a streaming TUI does mid-frame.
+               (ghostel--write-vt ,term "\e[?2026h\e[H\e[2JUPDATED-CONTENT")
+               (should (ghostel--mode-enabled ,term 2026))
+               ,@body))
+         (kill-buffer ,buffer)))))
+
+(ert-deftest ghostel-test-redraw-now-force-bypasses-open-sync-output ()
+  "FORCE makes `ghostel--redraw-now' repaint even while mode 2026 is open.
+Without FORCE the redraw is correctly suppressed during synchronized
+output; with FORCE it repaints now (the contract the #456 fix relies on)."
+  :tags '(native)
+  (ghostel-test--with-open-sync-output (buf term)
+    ;; Unforced redraw is suppressed mid synchronized output: still baseline.
+    (ghostel--redraw-now buf)
+    (should (string-match-p "BASELINE-CONTENT" (buffer-string)))
+    (should-not (string-match-p "UPDATED-CONTENT" (buffer-string)))
+    ;; Forced redraw bypasses the skip and repaints now.
+    (ghostel--redraw-now buf t)
+    (should (string-match-p "UPDATED-CONTENT" (buffer-string)))
+    (should-not (string-match-p "BASELINE-CONTENT" (buffer-string)))))
+
+(ert-deftest ghostel-test-window-buffer-change-repaints-stale-reappear ()
+  "Regression for #456: a buffer reappearing repaints past open mode 2026.
+A hidden ghostel buffer renders nothing, so its content is stale on
+reappear.  `ghostel--window-buffer-change' must force the repaint instead
+of leaving the stale content until the next non-2026 output."
+  :tags '(native)
+  (ghostel-test--with-open-sync-output (_buf term)
+    (ghostel--window-buffer-change (selected-window))
+    (should (string-match-p "UPDATED-CONTENT" (buffer-string)))
+    (should-not (string-match-p "BASELINE-CONTENT" (buffer-string)))))
+
+(ert-deftest ghostel-test-force-redraw-recovers-during-sync-output ()
+  "`ghostel-force-redraw' recovers stale content even while mode 2026 is open.
+The user-facing recovery command must not be defeated by the same
+synchronized-output skip that stranded the content (#456)."
+  :tags '(native)
+  (ghostel-test--with-open-sync-output (_buf term)
+    (ghostel-force-redraw)
+    (should (string-match-p "UPDATED-CONTENT" (buffer-string)))
+    (should-not (string-match-p "BASELINE-CONTENT" (buffer-string)))))
+
 (ert-deftest ghostel-test-resize-width-change-full-repaint ()
   "After width change on alt screen, all rows repainted correctly.
 Matches the real htop scenario: width changes from wide to narrow,

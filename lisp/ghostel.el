@@ -4661,13 +4661,18 @@ for BUFFER; return nil to let the redraw proceed."
                           #'ghostel--redraw-now buffer))
     t))
 
-(defun ghostel--redraw-now (buffer)
+(defun ghostel--redraw-now (buffer &optional force)
   "Perform the actual redraw in BUFFER.
-The renderer preserves buffer positions while applying terminal
-mutations; this function anchors windows that were following the
-live viewport."
+The renderer preserves buffer positions while applying terminal mutations;
+this function anchors windows that were following the live viewport.
+
+With FORCE non-nil, redraw even while synchronized output (mode 2026)
+is open.  Use it for repaints that must happen now regardless of frame
+batching, such as a buffer reappearing in a window; leave it nil for
+opportunistic output redraws that may safely wait for the frame to end."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
+      (when force (setq ghostel--force-next-redraw t))
       (when ghostel--redraw-timer
         (cancel-timer ghostel--redraw-timer)
         (setq ghostel--redraw-timer nil))
@@ -4728,11 +4733,12 @@ live viewport."
         (ghostel--detect-password-prompt)))))
 
 (defun ghostel-force-redraw ()
-  "Force a full terminal redraw on the next display cycle.
-Cancels any pending redraw timer and schedules an immediate one.
+  "Force an immediate terminal redraw, bypassing synchronized-output batching.
+Repaints now even while the terminal program holds mode 2026 open, so a
+buffer left showing stale content (e.g. revealed mid-frame) recovers.
 Requires the buffer to be visible in a window; has no effect otherwise."
   (interactive)
-  (ghostel--redraw-now (current-buffer)))
+  (ghostel--redraw-now (current-buffer) t))
 
 
 ;;; Window resize
@@ -4838,7 +4844,11 @@ and the TTY display that needs it off keeps working in parallel)."
   (when (and (window-live-p window)
              (eq (window-buffer window) (current-buffer)))
     (ghostel--anchor-window window)
-    (ghostel--redraw-now (current-buffer))))
+    ;; While hidden the buffer renders nothing, so its content can be
+    ;; stale on reappear.  Force the repaint past any open synchronized
+    ;; output (mode 2026); otherwise the redraw is skipped and the stale
+    ;; content lingers until the next non-2026 output, which may never come.
+    (ghostel--redraw-now (current-buffer) t)))
 
 (defun ghostel--minibuffer-exit ()
   "Schedule anchoring of all the currently anchored Ghostel windows.
