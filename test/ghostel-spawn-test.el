@@ -270,6 +270,41 @@ user's `.zprofile'/`.zshrc' load alongside it."
           (should (equal "/usr/bin/zsh" (car spawn)))
           (should (equal '("-l" "-i") (cdr spawn))))))))
 
+(ert-deftest ghostel-test-start-process-remote-defers-temp-cleanup ()
+  "Remote integration temp paths are cleaned on buffer-kill, not at spawn.
+Deleting them at spawn time would race the just-spawned async remote
+shell, which has not yet read its bootstrap (ZDOTDIR/.zshenv etc.); the
+pushed terminfo dir is needed for the whole session besides."
+  (let (cleaned)
+    (cl-letf (((symbol-function 'ghostel--setup-remote-integration)
+               (lambda (_type)
+                 (list :env nil :args nil
+                       :temp-files '("/tmp/ghostel-x.zsh")
+                       :temp-dirs '("/tmp/ghostel-zdot"))))
+              ((symbol-function 'ghostel--cleanup-temp-paths)
+               (lambda (files dirs) (setq cleaned (list files dirs))))
+              ((symbol-function 'ghostel--spawn-pty) (lambda (&rest _) nil)))
+      (let ((buf (generate-new-buffer " *ghostel-test-defer*")))
+        (unwind-protect
+            (progn
+              (with-current-buffer buf
+                (setq-local ghostel--term-rows 24
+                            ghostel--term-cols 80)
+                (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+                       (ghostel-tramp-shells '(("ssh" "/usr/bin/zsh")))
+                       (ghostel-shell-integration t)
+                       (ghostel-tramp-shell-integration t)
+                       (ghostel-macos-login-shell nil)
+                       (default-directory "/ssh:host:/home/u/"))
+                  (ghostel--start-process)))
+              ;; Not deleted at spawn time.
+              (should-not cleaned)
+              ;; Buffer-kill triggers the deferred cleanup with the paths.
+              (kill-buffer buf)
+              (should (equal cleaned
+                             '(("/tmp/ghostel-x.zsh") ("/tmp/ghostel-zdot")))))
+          (when (buffer-live-p buf) (kill-buffer buf)))))))
+
 (ert-deftest ghostel-test-macos-login-wrap-basic ()
   "Login wrap produces /usr/bin/login + bash shim with exec -l <prog>."
   (cl-letf (((symbol-function 'user-login-name) (lambda (&optional _) "alice"))

@@ -31,6 +31,15 @@ All notable changes to this project will be documented in this file.
   method.
   Fixes [#444](https://github.com/dakra/ghostel/issues/444).
 
+### Fixed
+- Remote shell integration: the per-session temp files (zsh `ZDOTDIR`, bash
+  `--rcfile`, fish init script, and the pushed terminfo dir) were deleted
+  immediately after the asynchronous spawn, racing the remote shell that had
+  not yet read them. The shell would then start with `ZDOTDIR` pointing at a
+  deleted directory, so neither the integration nor the user's own config
+  loaded. Cleanup is now deferred to buffer-kill, past the shell's startup read
+  and the session-long lifetime of the terminfo dir.
+
 ## [0.37.0] — 2026-06-21
 
 ### Added

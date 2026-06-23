@@ -4435,7 +4435,7 @@ run the shell on the remote host."
                             (t nil)))
          ;; Start recognized remote shells login+interactive so they (and the
          ;; user's rc/profile) load.  When integration is active the default
-         ;; adapts per shell (bash drops `-l' to keep `--rcfile'.  Explicit
+         ;; adapts per shell (bash drops `-l' to keep `--rcfile').  Explicit
          ;; per-method args from `ghostel-tramp-shells' override the default.
          (shell-args (append
                       (or extra-shell-args
@@ -4460,9 +4460,11 @@ run the shell on the remote host."
          (proc (ghostel--spawn-pty spawn-program spawn-args
                                    extra-env remote-p)))
     (when remote-integration
-      (ghostel--cleanup-temp-paths
-       (plist-get remote-integration :temp-files)
-       (plist-get remote-integration :temp-dirs)))
+      (let ((files (plist-get remote-integration :temp-files))
+            (dirs (plist-get remote-integration :temp-dirs)))
+        (add-hook 'kill-buffer-hook
+                  (lambda () (ghostel--cleanup-temp-paths files dirs))
+                  nil t)))
     proc))
 
 
