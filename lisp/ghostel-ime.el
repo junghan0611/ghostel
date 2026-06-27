@@ -94,7 +94,16 @@ to the PTY as UTF-8 only in terminal-input modes."
             ;; translator; calling it would silently skip composition.
             (eq original #'list))
         (list key)
-      (let ((events (let ((inhibit-read-only t))
+      ;; Bind `buffer-read-only' to nil, not just `inhibit-read-only', around
+      ;; the input method.  Some Lisp IMEs gate composition on the variable
+      ;; directly: `hangul2-input-method' opens with
+      ;;   (if (or buffer-read-only ...) (list key) ...)
+      ;; and returns the key untranslated when the buffer is read-only.
+      ;; `inhibit-read-only' only lifts the modification barrier, so without
+      ;; this the IME never composes in a protected ghostel buffer and the
+      ;; raw keystroke is forwarded instead of the committed syllable.
+      (let ((events (let ((inhibit-read-only t)
+                          (buffer-read-only nil))
                       (funcall original key))))
         (let ((after-point (point)))
           (when (> after-point before-point)
