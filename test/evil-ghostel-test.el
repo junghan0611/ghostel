@@ -1255,6 +1255,24 @@ line)."
          (evil-ghostel-paste-after 1))
        (should (equal "world" pasted))))))
 
+(ert-deftest evil-ghostel-test-paste-interactive-on-read-only ()
+  "Interactive p/P does not trip the read-only guard — paste goes via the PTY.
+Regression: `(interactive \"*P\")' barfed on the read-only ghostel buffer
+before the body ran, even though the live-terminal path writes nothing to it.
+`active-p' is stubbed so the test isolates the interactive spec, not the
+live-terminal detection."
+  (evil-ghostel-test--with-evil-buffer
+   (setq buffer-read-only t)
+   (let (pasted)
+     (cl-letf (((symbol-function 'evil-ghostel--active-p) (lambda () t))
+               ((symbol-function 'evil-ghostel--do-paste)
+                (lambda (&rest _) (setq pasted t))))
+       (call-interactively #'evil-ghostel-paste-after)
+       (should pasted)
+       (setq pasted nil)
+       (call-interactively #'evil-ghostel-paste-before)
+       (should pasted)))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: insert-state Ctrl key passthrough
 ;; -----------------------------------------------------------------------

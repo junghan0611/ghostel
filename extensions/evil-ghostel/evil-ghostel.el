@@ -670,7 +670,7 @@ unless at end-of-input, where a right arrow would accept a suggestion."
 (defun evil-ghostel-paste-after (&optional count register yank-handler)
   "Paste after the cursor via bracketed paste COUNT times from REGISTER.
 YANK-HANDLER is used by Evil outside live terminal input.  Covers p."
-  (interactive "*P")
+  (interactive "P")
   (if (evil-ghostel--active-p)
       (evil-ghostel--do-paste count register t)
     (evil-paste-after count register yank-handler)))
@@ -678,7 +678,7 @@ YANK-HANDLER is used by Evil outside live terminal input.  Covers p."
 (defun evil-ghostel-paste-before (&optional count register yank-handler)
   "Paste before the cursor via bracketed paste COUNT times from REGISTER.
 YANK-HANDLER is used by Evil outside live terminal input.  Covers P."
-  (interactive "*P")
+  (interactive "P")
   (if (evil-ghostel--active-p)
       (evil-ghostel--do-paste count register nil)
     (evil-paste-before count register yank-handler)))
