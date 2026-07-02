@@ -567,16 +567,16 @@ algorithm; this one walks scrollback math and viewport offsets too)."
 line N must be converted to viewport row N-scrollback before
 diffing — otherwise dy is wrong by the scrollback line count."
   (skip-unless (fboundp 'ghostel--new))
-  (let ((term (ghostel--new 5 40 1000)))
-    ;; Push 12 rows so the viewport shows rows 8..12 plus a trailing
-    ;; cursor row.
-    (dotimes (i 12)
-      (ghostel--write-vt term (format "row-%02d\r\n" i)))
-    (ghostel--write-vt term "tail")
-    (with-temp-buffer
-      (ghostel-mode)
+  (with-temp-buffer
+    (ghostel-mode)
+    (let ((term (ghostel--new 5 40 1000)))
       (setq-local ghostel--term term)
       (setq-local ghostel--term-rows 5)
+      ;; Push 12 rows so the viewport shows rows 8..12 plus a trailing
+      ;; cursor row.
+      (dotimes (i 12)
+        (ghostel--write-vt term (format "row-%02d\r\n" i)))
+      (ghostel--write-vt term "tail")
       (evil-local-mode 1)
       (evil-ghostel-mode 1)
       (let ((inhibit-read-only t))
