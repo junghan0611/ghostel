@@ -390,6 +390,10 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
         \\0 disables kitty graphics entirely.
         \\KITTY-MEDIUMS is a bitfield: bit 0 = file medium, bit 1 = temp-file medium,
         \\bit 2 = shared-memory medium (default 0 = direct only).
+        \\
+        \\The returned handle is buffer-affine: `ghostel--new' initializes
+        \\renderer-owned buffer-local state in the current buffer, and later
+        \\GhostelTerm operations must be called with that same buffer current.
         ,
         .impl = struct {
             pub fn call(env: emacs.Env, nargs: isize, args: [*c]emacs.Value) !emacs.Value {
