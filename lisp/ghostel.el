@@ -361,9 +361,9 @@ project:
   A terminal that walked out of the project is excluded; a plain
   `ghostel' buffer that cd'd into the project is included.
 - `identity': match each buffer's `ghostel--buffer-identity'
-  against the value `project-prefixed-buffer-name' would produce
-  for the current project.  Stable across `cd', but only finds
-  buffers originally created via `ghostel-project'.
+  against the name `ghostel-project' would use for the current project.
+  Stable across `cd', but only finds buffers originally
+  created via `ghostel-project'.
 - `both' (default): union of the two - `default-directory' first,
   then identity-matched buffers not already covered."
   :type '(choice (const :tag "Match by buffer default-directory" default-directory)
@@ -5178,10 +5178,23 @@ already has a live ghostel process."
       (let ((remote-p (file-remote-p default-directory)))
         (ghostel--spawn-pty program args nil remote-p)))))
 
+(defun ghostel--project-buffer-name (root)
+  "Return the project-prefixed ghostel buffer name for project ROOT.
+For remote ROOTs the TRAMP prefix is folded into the name so a local
+and a remote project with the same name get distinct buffers."
+  (let ((name (project-prefixed-buffer-name
+               (string-trim ghostel-buffer-name "*" "*")))
+        (remote (file-remote-p root)))
+    (if remote
+        (format "%s@%s*" (substring name 0 -1)
+                (string-trim remote "/" ":"))
+      name)))
+
 ;;;###autoload
 (defun ghostel-project (&optional arg)
   "Start a new Ghostel terminal in the current project's root.
-The buffer name is prefixed with the project name.
+The buffer name is prefixed with the project name; remote (TRAMP) projects also
+carry the remote host, to distinguish equally named local and remote projects.
 If a buffer already exists for this project, switch to it.
 Otherwise create a new Ghostel buffer.  ARG is passed through to
 `ghostel' and accepts the same universal argument conventions.
@@ -5189,9 +5202,8 @@ To add this to `project-switch-commands':
   (add-to-list \\='project-switch-commands \\='(ghostel-project \"Ghostel\") t)
 Returns the buffer."
   (interactive "P")
-  (let ((default-directory (project-root (project-current t)))
-        (ghostel-buffer-name (project-prefixed-buffer-name
-                              (string-trim ghostel-buffer-name "*" "*"))))
+  (let* ((default-directory (project-root (project-current t)))
+         (ghostel-buffer-name (ghostel--project-buffer-name default-directory)))
     (ghostel arg)))
 
 (defun ghostel-other ()
@@ -5229,11 +5241,7 @@ against a TRAMP path would walk the remote filesystem
 synchronously on every cycle."
   (let* ((proj (project-current t))
          (root (project-root proj))
-         (identity-prefix
-          (let ((ghostel-buffer-name
-                 (project-prefixed-buffer-name
-                  (string-trim ghostel-buffer-name "*" "*"))))
-            ghostel-buffer-name))
+         (identity-prefix (ghostel--project-buffer-name root))
          (scope ghostel-project-buffer-scope)
          (all (ghostel--all-buffers))
          (by-dir
